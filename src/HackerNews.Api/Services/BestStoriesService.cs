@@ -101,7 +101,6 @@ public sealed class BestStoriesService(
 
     private async Task RefreshCoreAsync(bool forceRefresh, CancellationToken cancellationToken)
     {
-        // Publish the shared task under the gate before doing I/O.
         await Task.Yield();
         await InitializeAsync();
         try
@@ -112,45 +111,13 @@ public sealed class BestStoriesService(
             var batch = await store.PrepareBatchAsync(ids.Where(id => id > 0).Distinct().ToArray(),
                 timeProvider.GetUtcNow(), settings.ReconciliationInterval, settings.UpdateBatchSize,
                 forceRefresh, cancellationToken);
-            var results = new ConcurrentBag<StoryFetchResult>();
-            await Parallel.ForEachAsync(batch.Items, new ParallelOptions
-            {
-                MaxDegreeOfParallelism = settings.MaxUpstreamConcurrency,
-                CancellationToken = cancellationToken
-            }, async (work, token) =>
-            {
-                try
-                {
-                    var item = await client.GetItemAsync(work.Id, token);
-                    StoryResponse? story = null;
-                    if (item is { Deleted: false, Dead: false, Type: "story", Time: not null, Score: not null } &&
-                        !string.IsNullOrWhiteSpace(item.Title) && !string.IsNullOrWhiteSpace(item.By))
-                    {
-                        story = new StoryResponse(item.Title, string.IsNullOrWhiteSpace(item.Url) ? null : item.Url,
-                            item.By, DateTimeOffset.FromUnixTimeSeconds(item.Time.Value), item.Score.Value, item.Descendants ?? 0);
-                    }
-                    results.Add(new StoryFetchResult(work, story, true));
-                }
-                catch (Exception exception) when (exception is HttpRequestException or JsonException or ArgumentOutOfRangeException ||
-                                                  exception is OperationCanceledException && !token.IsCancellationRequested)
-                {
-                    logger.LogWarning(exception, "Failed Hacker News item {ItemId}", work.Id);
-                    results.Add(new StoryFetchResult(work, null, exception is ArgumentOutOfRangeException));
-                }
-            });
+            var results = await FetchBatchAsync(client, batch, cancellationToken);
+
             cancellationToken.ThrowIfCancellationRequested();
-            var next = await store.CommitBatchAsync(batch, results.ToArray(),
+            var next = await store.CommitBatchAsync(batch, results,
                 timeProvider.GetUtcNow(), settings.MaximumStoryCount, cancellationToken);
-            if (next is not null)
-            {
-                Volatile.Write(ref snapshot, next);
-                logger.LogInformation("Processed {ItemCount} items; serving {StoryCount} persisted stories",
-                    batch.Items.Count, next.Stories.Length);
-            }
-            else
-            {
-                logger.LogWarning("No usable persisted snapshot is available");
-            }
+
+            PublishSnapshot(next, batch.Items.Count);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -161,5 +128,70 @@ public sealed class BestStoriesService(
         {
             logger.LogWarning(exception, "Refresh failed; retaining the previous committed snapshot and pending work");
         }
+    }
+
+    private async Task<StoryFetchResult[]> FetchBatchAsync(HackerNewsClient client, StoryBatch batch,
+        CancellationToken cancellationToken)
+    {
+        var results = new ConcurrentBag<StoryFetchResult>();
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = settings.MaxUpstreamConcurrency,
+            CancellationToken = cancellationToken
+        };
+
+        await Parallel.ForEachAsync(batch.Items, parallelOptions, async (work, token) =>
+        {
+            results.Add(await FetchStoryAsync(client, work, token));
+        });
+
+        return results.ToArray();
+    }
+
+    private async Task<StoryFetchResult> FetchStoryAsync(HackerNewsClient client, PendingStory work,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var item = await client.GetItemAsync(work.Id, cancellationToken);
+            return new StoryFetchResult(work, MapStory(item), true);
+        }
+        catch (Exception exception) when (
+            exception is HttpRequestException or JsonException or ArgumentOutOfRangeException ||
+            exception is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+        {
+            logger.LogWarning(exception, "Failed Hacker News item {ItemId}", work.Id);
+            return new StoryFetchResult(work, null, exception is ArgumentOutOfRangeException);
+        }
+    }
+
+    private static StoryResponse? MapStory(HackerNewsItem? item)
+    {
+        if (item is not { Deleted: false, Dead: false, Type: "story", Time: not null, Score: not null } ||
+            string.IsNullOrWhiteSpace(item.Title) || string.IsNullOrWhiteSpace(item.By))
+        {
+            return null;
+        }
+
+        return new StoryResponse(
+            item.Title,
+            string.IsNullOrWhiteSpace(item.Url) ? null : item.Url,
+            item.By,
+            DateTimeOffset.FromUnixTimeSeconds(item.Time.Value),
+            item.Score.Value,
+            item.Descendants ?? 0);
+    }
+
+    private void PublishSnapshot(StorySnapshot? next, int itemCount)
+    {
+        if (next is null)
+        {
+            logger.LogWarning("No usable persisted snapshot is available");
+            return;
+        }
+
+        Volatile.Write(ref snapshot, next);
+        logger.LogInformation("Processed {ItemCount} items; serving {StoryCount} persisted stories",
+            itemCount, next.Stories.Length);
     }
 }

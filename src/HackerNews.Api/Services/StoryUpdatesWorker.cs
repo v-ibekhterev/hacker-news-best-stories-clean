@@ -48,8 +48,16 @@ public sealed class StoryUpdatesWorker(
             {
                 return;
             }
-            delay = TimeSpan.FromMilliseconds(Math.Min(delay.TotalMilliseconds * 2,
-                Math.Max(options.Value.StreamReconnectDelay.TotalMilliseconds, TimeSpan.FromMinutes(1).TotalMilliseconds)));
+            delay = NextReconnectDelay(delay);
         }
+    }
+
+    private TimeSpan NextReconnectDelay(TimeSpan currentDelay)
+    {
+        var maximumDelay = Math.Max(
+            options.Value.StreamReconnectDelay.TotalMilliseconds,
+            TimeSpan.FromMinutes(1).TotalMilliseconds);
+
+        return TimeSpan.FromMilliseconds(Math.Min(currentDelay.TotalMilliseconds * 2, maximumDelay));
     }
 }

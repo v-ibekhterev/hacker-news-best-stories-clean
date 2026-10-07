@@ -1,376 +1,243 @@
 # Hacker News Best Stories API
 
-Returns the highest-scoring acquired records from Hacker News's best-story candidate
-list. PostgreSQL stores acquired items, pending updates, reconciliation progress, and
-the last usable snapshot. The API serves a bounded immutable top-results snapshot
-from memory; restarting does not discard acquired records or re-fetch every item.
+ASP.NET Core API with PostgreSQL-backed acquisition, immutable in-memory top results,
+streamed updates, and durable asynchronous exports.
 
-## Start with Docker Compose
+**Local-only, unauthenticated deployment.** Operation IDs are not authorization.
+Add authenticated ownership and abuse protection before exposing this API publicly.
 
-Prerequisites: Docker Desktop with the Linux/WSL 2 engine and Docker Compose.
+## Run
+
+Requires Docker Desktop with Linux containers and Compose.
 
 ```powershell
 Copy-Item .env.example .env
-# Edit .env: replace POSTGRES_PASSWORD with a strong local password.
+# Replace POSTGRES_PASSWORD in .env with a strong password.
 docker compose up --build -d --wait
-docker compose ps
-curl.exe "http://localhost:5080/health/live"
-curl.exe "http://localhost:5080/health/ready"
 curl.exe "http://localhost:5080/api/stories/best?count=10"
-curl.exe "http://localhost:5080/openapi/v1.json"
 ```
 
-`.env` is ignored by Git and excluded from the image build. Do not commit it.
-Compose uses PostgreSQL 17, a named `beststories_postgres-data` volume, and its
-private service network. The API connects to `db:5432`; host ports bind only to
-`127.0.0.1`. Customize `POSTGRES_PORT` or `API_PORT` in `.env` if those ports are busy.
+Ports bind to loopback: API `5080`, PostgreSQL `5432`. Override `API_PORT` and
+`POSTGRES_PORT` in `.env`. The API uses `db:5432` on Compose's private network.
+Secrets and generated artifacts are ignored; never commit `.env`.
 
-If the host can restore NuGet but Docker's network cannot (for example corporate
-TLS restrictions), use the explicit host-published runtime target instead:
+If host NuGet restore works but container restore is blocked by corporate TLS:
 
 ```powershell
 dotnet publish src\HackerNews.Api -c Release -p:UseAppHost=false -o .artifacts\publish
 docker compose -f compose.yaml -f compose.host-published.yaml up --build -d --wait
 ```
 
-This copies portable managed publish output, not a Windows executable, into the
-Linux runtime image. Regenerate it after every code change. It does not bypass TLS
-verification, and `.artifacts` is ignored by Git. Use the same two Compose files
-for subsequent rebuild/up commands when using this fallback.
+This copies portable managed output into the Linux runtime without disabling TLS.
+Republish after code changes; use both Compose files for subsequent rebuilds.
 
-PostgreSQL's `pg_isready` health check gates API startup. `/health/live` is process-only;
-`/health/ready` requires both PostgreSQL connectivity and a usable snapshot. A new
-empty installation may report 503 until an initial batch yields valid stories.
-The image intentionally does not install curl or a Docker-specific API health command;
-configure deployment HTTP probes for `/health/live` and `/health/ready` on port 8080.
+For host development, use stable .NET SDK 10.0.401 or a compatible 10.0 patch
+(`global.json`). Stop the container API before starting another ingestion owner:
 
 ```powershell
-docker compose logs --tail 50 api
-docker compose exec db pg_isready -U hackernews -d hackernews
-docker compose restart api
-docker compose down
-docker compose up -d --wait
-```
-
-Ordinary `down` preserves the named volume. **Do not use `down --volumes` unless you
-intend to delete all acquired data and force a new acquisition.** A named volume
-survives container replacement, not loss of the Docker host; production needs durable
-storage and backups.
-
-## Run on the host
-
-Prerequisite: stable .NET SDK 10.0.401 or a newer 10.0 patch (pinned in `global.json`).
-Start PostgreSQL first:
-
-```powershell
+docker compose stop api
 docker compose up -d --wait db
-# Configure using .NET user-secrets; enter the actual password from .env.
 dotnet user-secrets set "ConnectionStrings:Postgres" "Host=localhost;Port=5432;Database=hackernews;Username=hackernews;Password=<password>;Timeout=5;Command Timeout=30" --project src\HackerNews.Api
 dotnet restore
 dotnet build --no-restore
 dotnet test --no-build
 dotnet format --verify-no-changes
-dotnet run --project src\HackerNews.Api -- --urls http://localhost:5080
+dotnet run --project src\HackerNews.Api
 ```
 
-Alternatively set `ConnectionStrings__Postgres` in the environment. Never place the
-real connection string in tracked configuration. The shorter
-`dotnet run --project src\HackerNews.Api` uses launchSettings.json's port.
-Production does not silently fall back to memory when the database is missing.
+Alternatively set `ConnectionStrings__Postgres`. Host launch ports come from
+`launchSettings.json`; add `-- --urls http://localhost:5080` to match Compose.
 
-## HTTP contract
+## API
 
-`GET /api/stories/best?count=n`, with one integer in `1..MaximumStoryCount` (default 100).
-Missing, malformed, repeated, zero, negative, overflowing, or excessive values return
-400 RFC 7807 `ProblemDetails` (`application/problem+json`); values are never clamped.
-If no usable snapshot exists after the bounded initial wait, return 503 ProblemDetails.
-Requests never expand the dataset or trigger a full initial load.
+| Route | Response |
+|-------|----------|
+| `GET /api/stories/best?count=10` | Up to count acquired stories; required integer `1..MaximumStoryCount` |
+| `POST /api/story-exports` | 202 with operationId, status, statusPath, Location, and Retry-After: 5 |
+| `GET /api/story-exports/{id}` | Status, counts, timestamps, generation, safe error, and resultsPath on success |
+| `GET /api/story-exports/{id}/results?pageSize=1000` | Completed frozen results: operationId, items, nextContinuationToken |
+| `GET /health/live` | Process liveness; no upstream/database calls |
+| `GET /health/ready` | Requires usable snapshot and database connectivity |
+| `GET /openapi/v1.json` | OpenAPI JSON; no Swagger UI or root-page endpoint |
 
-200 returns at most `count` acquired valid stories, score descending with ID ascending
-as the tie-breaker. Partial acquisition may yield fewer stories than requested.
-OpenAPI: `/openapi/v1.json`; no Swagger UI is bundled.
+Stories are ordered by score descending, then ID ascending:
 
 ```json
-[
-  {
-    "title": "A story title",
-    "uri": "https://example.com/story",
-    "postedBy": "username",
-    "time": "2019-10-12T13:43:01+00:00",
-    "score": 1716,
-    "commentCount": 572
-  }
-]
+{
+  "title": "A story title",
+  "uri": "https://example.com/story",
+  "postedBy": "username",
+  "time": "2026-10-07T00:00:00+00:00",
+  "score": 100,
+  "commentCount": 12
+}
 ```
 
-`time` is converted from Unix seconds to UTC DateTimeOffset. Scores come from upstream;
-missing descendants becomes zero. Missing URL becomes null. Null, deleted, dead,
-non-story, missing title/author/time/score, and invalid timestamps are excluded.
-Unknown upstream JSON fields are ignored.
+Unix time becomes UTC DateTimeOffset; missing URL becomes null and missing
+descendants becomes zero. Null, deleted, dead, non-story, missing required fields,
+and invalid timestamps are excluded. Results may contain fewer acquired records
+than requested; neither endpoint waits for complete upstream acquisition.
 
-## Asynchronous exports
+### Export example
 
-Exports read only the shared persisted candidate dataset; they never fetch upstream
-items. The synchronous endpoint and its count limit are unchanged. **Exports have no
-authentication: this deployment is local-only. Do not publish it on a public network.**
-An operation ID or idempotency key is not authorization. Authentication/ownership
-and per-caller rate limits must be added before public deployment.
+Send the key as a **header**, not a JSON property. Poll using the returned
+**operationId**, not the key:
 
 ```powershell
-$request = @{ count = 1000000 } | ConvertTo-Json
-$created = Invoke-RestMethod -Method Post -Uri http://localhost:5080/api/story-exports `
-    -ContentType application/json -Headers @{ "Idempotency-Key" = [guid]::NewGuid().ToString() } -Body $request
-$id = $created.operationId
+$export = Invoke-RestMethod -Method Post -Uri http://localhost:5080/api/story-exports `
+    -ContentType application/json -Headers @{ "Idempotency-Key" = [guid]::NewGuid().ToString() } `
+    -Body '{"count":1000000}'
+$id = $export.operationId
 Invoke-RestMethod "http://localhost:5080/api/story-exports/$id"
 # Once status is succeeded:
 $page = Invoke-RestMethod "http://localhost:5080/api/story-exports/$id/results?pageSize=1000"
-$page.items
 if ($page.nextContinuationToken) {
     $token = [uri]::EscapeDataString($page.nextContinuationToken)
     Invoke-RestMethod "http://localhost:5080/api/story-exports/$id/results?pageSize=1000&continuationToken=$token"
 }
 ```
 
-| Route | Contract |
-|-------|----------|
-| `POST /api/story-exports` | JSON integer `count` in `1..Exports:MaximumCount`; one `Idempotency-Key` header, 1..128 printable ASCII characters without spaces. Returns 202 with operationId, status, statusPath, Location, and Retry-After: 5. |
-| `GET /api/story-exports/{id}` | 200 with status (`queued`, `inProgress`, `succeeded`, `failed`), requestedCount, processedCount, nullable resultCount, timestamps, nullable datasetGeneration, safe error, and resultsPath only on success. |
-| `GET /api/story-exports/{id}/results` | Completed frozen values only. Optional pageSize defaults to 100 (or the configured ceiling if smaller); optional continuationToken. Returns operationId, items, nextContinuationToken (null at end). |
+Creation requires integer count and one global Idempotency-Key containing 1..128
+printable ASCII characters without spaces. Same key/count replays the operation;
+different count conflicts. Status progresses through queued, inProgress, then
+succeeded or failed. Page size defaults to 100 (or the configured ceiling if lower);
+keep it unchanged with a token. Pages may be smaller to fit the exact JSON byte
+limit; the final token is null. Exports can succeed with zero available records.
 
-Malformed JSON/count/header/page size or invalid/tampered/expired tokens return
-400 ProblemDetails; non-JSON creation returns 415. Same key/count replays the existing
-operation; same key/different count returns 409. Idempotency keys are global in this
-unauthenticated deployment. Active-job or retained-row capacity exhaustion returns
-429 with Retry-After. Unknown operations return 404, incomplete/failed result retrieval
-409, expired operations 410 while tombstones remain, and storage unavailability 503.
-Expiration may return 404 after tombstone retention. Expired tokens return 400;
-query an operation without a token to distinguish expired results.
+Errors use ProblemDetails (`application/problem+json`):
 
-The single background worker atomically freezes ranking **and values** using a
-server-side PostgreSQL INSERT/SELECT with one MVCC statement snapshot. Its source
-view is pinned when preparation begins, not when the request is queued; generation
-is null until that freeze commits. Exports succeed with fewer available records,
-including zero. They do not wait for acquisition to reach the requested count.
-Sort order is score descending, then story ID ascending.
+| Status | Meaning |
+|--------|---------|
+| 400 | Invalid count/body/header/page size or tampered, incompatible, expired token |
+| 404 | Unknown operation or expired metadata already removed |
+| 409 | Idempotency conflict or results not succeeded |
+| 410 | Expired operation while tombstone remains |
+| 415 | Non-JSON export creation |
+| 429 | Export admission/row quota exhausted; Retry-After: 5 |
+| 503 | No initial story snapshot or unavailable export storage/results |
 
-Freezing all selected rows is one database transaction, not a million-row application
-buffer or a resumable chunked source copy. An interrupted freeze rolls back and is
-retried against a fresh view. This avoids retaining upstream record versions or
-holding a database snapshot across restarts, at the cost of potentially substantial
-transaction duration, WAL, disk, and database sorting/spill work. After the freeze,
-bounded validation chunks durably advance processedCount. A restart resumes the last
-committed validation checkpoint against the same frozen rows; partial results stay
-private. Only a final committed checkpoint exposes success. Database queue locks
-serialize admission/processing checkpoints and make repeat execution safe; one worker
-is configured, and the existing single-ingestion-instance restriction remains.
+Counts are never clamped. Repeated/missing synchronous count values are invalid.
 
-Result reads use indexed ordinals and bounded row/byte selection in one repeatable-read
-transaction, so cleanup cannot remove half a page. Pages can contain fewer than
-pageSize items to honor the **exact serialized JSON byte limit**. A single record that
-cannot fit, including a conservative 2 KiB envelope/token allowance, fails the export
-with `recordTooLarge` instead of producing unpageable results. Invalid persisted
-stories fail with `invalidDataset`; SQL failures are logged and retried until deadline.
-Accepted work survives request disconnects. No cancellation endpoint is implemented.
-
-HMAC-protected tokens bind version, operation, dataset generation, last ordinal,
-page size, and expiry. Keep pageSize unchanged when following a token. The signing key
-is generated once and stored in PostgreSQL, so container restarts and database
-backup/restore preserve tokens. Protect database access/backups; key rotation is not
-implemented. Restoring a backup also restores its jobs and signing key.
-
-| Exports setting | Default | Meaning |
-|-----------------|---------|---------|
-| MaximumCount | 1,000,000 | Requested-count ceiling |
-| MaximumActiveJobs | 10 | Queued + in-progress admission ceiling |
-| MaximumReservedRows | 2,000,000 | Global row budget: requested counts while active, actual counts when succeeded |
-| ChunkSize | 500 | Validation/checkpoint rows; positive, at most MaximumPageSize |
-| MaximumPageSize | 1,000 | Page-count ceiling |
-| MaximumResponseBytes | 1,048,576 | Exact serialized JSON page ceiling; minimum 4 KiB |
-| JobDeadline | 00:30:00 | From acceptance, including queue time; timeout fails and deletes private rows |
-| Retention | 1.00:00:00 | Results and idempotency mapping retained after success/failure |
-| TombstoneRetention | 1.00:00:00 | Additional expired metadata retention |
-| PollInterval | 00:00:05 | Idle/retry/cleanup cadence |
-
-Use the `Exports` configuration section or `Exports__...` environment variables.
-Limits and timer ranges are startup-validated. Cleanup runs on worker ticks and
-admission; failed/expired rows release reserved capacity, and expired mappings allow
-key reuse. A page started before cleanup sees a consistent retained view. Row budgets
-are **not disk-byte quotas**; monitor PostgreSQL disk/WAL space and size deployment
-storage for actual story widths. Queue locking can delay admission while a large
-freeze/cleanup runs. No throughput guarantee, artifact reuse, public abuse protection,
-or multi-node ingestion failover is implied.
-
-## Durable acquisition and startup
+## Architecture and recovery
 
 ```text
-Startup -> transactional schema/source validation -> restore bounded top snapshot
-                                                    |
-updates SSE -> durable dirty versions/order -> bounded item batch <- minute timer
-                                                    |
-                         PostgreSQL item results + progress + snapshot transaction
-                                                    |
-                            immutable top-result snapshot -> normal API reads
+HN membership + updates SSE -> durable pending versions -> bounded item batches
+                                      |
+                  PostgreSQL records + progress + ranked snapshot transaction
+                                      |
+                  atomic memory snapshot -> synchronous reads
+                                      |
+                  frozen export rows -> checkpoints -> protected result pages
 ```
 
-One API ingestion instance owns each database through a session advisory lock.
-A second owner fails explicitly. No multi-node refresh or ownership failover is
-implemented. The owner connection is kept open for all state writes; losing it
-fails closed and stops background acquisition/application instead of continuing
-without fencing. Restart the instance once PostgreSQL is available.
+The typed HTTP clients handle upstream I/O; services handle acquisition, mapping,
+and publication; endpoints validate requests and translate outcomes. Startup
+transactionally migrates schemas, validates source identity, and restores only
+bounded top rows using the score/ID index. Corrupt/incompatible/unavailable storage
+fails startup; there is no memory-only fallback or silent reset.
 
-At startup, the schema is created/migrated transactionally if absent or older, and the stored
-source URL/schema version is checked. Incompatible state, source mismatch, invalid
-snapshot, or unavailable database fails startup explicitly. Never silently clear the
-store or reload the whole source in response to a storage failure.
-Subsequent starts restore the persisted ranked rows using a `(score DESC, id ASC)`
-partial index and a SQL LIMIT, not a full database copy into memory. The last nonempty
-snapshot is stored too, so a completely empty candidate cache can still restore
-the deliberately retained stale snapshot.
+One ingestion instance owns each database through a session advisory lock.
+Initial acquisition is single-flight and bounded by UpdateBatchSize. Refreshes
+do not overlap. Successful batches commit records, notification versions, and
+snapshot together before atomic memory publication. Failed item reads retain
+previous data and pending work; there are no immediate item retries. Empty refreshes
+retain the last nonempty snapshot indefinitely, including across restart.
+Reads can serve it during database outages while readiness fails; a lost owner
+session fails closed and requires restart when the database recovers.
 
-Empty-store acquisition is resumable and **bounded from its first batch**, unlike
-the previous full bootstrap. Each minute refreshes membership and fetches at most
-UpdateBatchSize items. Candidate rows preserve notification versions, FIFO order,
-acquisition timestamps, and uncompleted work. Selecting work does not acknowledge it.
-A crash before result commit leaves it pending; a crash after commit restores the
-committed state. A newer notification received during a fetch stays pending.
+SSE IDs are durably marked before the next event; duplicates coalesce by version.
+Connection/idle timeouts and exponential reconnect backoff apply. Membership
+checks and rolling reconciliation repair gaps; no lossless event replay is claimed.
+Reconciliation progress and unfinished batches survive restart.
 
-Successful item reads replace or remove the cached item. HTTP/JSON/timeout failures
-retain old data and pending work, moving the failure to the queue tail. There are no
-immediate item retries. Results, processed versions, and the bounded serving snapshot
-are committed together; only after commit is the memory reference replaced.
-Requests continue using the previous complete snapshot during work.
-If no valid records remain, retain the previous nonempty snapshot indefinitely.
-Snapshot age is publication age, not the age of every included item.
+Exports never fetch upstream items. A single worker freezes values/order/generation
+in one server-side MVCC statement when preparation starts, then validates bounded
+chunks with durable checkpoints. Interrupted freezes roll back and retry a fresh
+view; committed rows/checkpoints resume unchanged. Partial output stays private.
+Queue locks serialize admission/checkpoints; repeatable-read pages remain consistent
+during cleanup. Oversized/invalid stories fail with recordTooLarge/invalidDataset;
+SQL failures log/retry until deadline. Request disconnects do not cancel accepted work.
 
-Transient command failures are logged and never published as successful commits.
-An already loaded snapshot can serve reads during a database outage; database
-readiness fails. Loss of the owner session requires an application restart rather
-than an unsafe automatic ownership takeover.
-
-## Updates and reconciliation
-
-The long-lived `/updates.json` SSE connection extracts item IDs from Firebase put/patch
-events, ignores profiles, and durably marks only existing candidates dirty before
-accepting the next event. Multiple IDs are written in one database command.
-Duplicates coalesce into a single pending record with a version; no full story records
-are supplied by updates. Removing IDs from the feed is not a story-deletion signal.
-Membership checks discover new/departed candidates separately.
-
-Connection headers use RequestTimeout; read inactivity (including missing keep-alives)
-uses StreamIdleTimeout. EOF, malformed events, transport errors, and Firebase cancel
-events reconnect with exponential backoff from StreamReconnectDelay to 60 seconds
-(or the configured base when larger). Valid data events reset the delay.
-
-Every ReconciliationInterval, clean candidates are queued for a rolling recheck.
-Dirty/pending candidates already scheduled are not reset. Queue state and the
-reconciliation timestamp are durable, so restarting continues uncompleted work.
-A complete pass still costs one item GET per candidate. The updates feed has no
-documented durable replay guarantee; bootstrap/disconnection gaps are repaired by
-reconciliation, not claimed to be lossless.
+HMAC tokens bind operation, generation, position, page size, version, and expiry.
+Their signing key is persisted in PostgreSQL; backups and restarts preserve tokens.
+Protect database access/backups. Key rotation and cancellation are not implemented.
 
 ## Configuration
 
-HackerNews options are validated at startup; override via appsettings.json or variables
-such as `HackerNews__UpdateBatchSize`. The PostgreSQL connection string is mandatory.
+Override sections in `appsettings.json` or environment variables, such as
+`HackerNews__UpdateBatchSize` and `Exports__MaximumCount`. Options validate at startup:
+positive supported timer ranges/counts; absolute HTTP(S) BaseUrl with trailing slash.
 
-| Setting | Default | Constraint |
-|---------|---------|------------|
-| BaseUrl | `https://hacker-news.firebaseio.com/v0/` | Absolute HTTP(S), trailing slash |
-| RefreshInterval | `00:01:00` | Positive timer range; membership/batch cadence |
-| RequestTimeout | `00:00:10` | Positive HttpClient range; per request, not whole batch |
-| InitialLoadWaitTimeout | `00:00:15` | Positive timer range; caller wait bound |
-| MaxUpstreamConcurrency | `10` | At least 1 |
-| MaximumStoryCount | `100` | At least 1; maximum in-memory serving records |
-| UpdateBatchSize | `100` | At least 1; per acquisition batch, including first load |
-| ReconciliationInterval | `00:30:00` | Positive timer range |
-| StreamReconnectDelay | `00:00:05` | Positive timer range |
-| StreamIdleTimeout | `00:01:00` | Positive timer range |
+| HackerNews setting | Default |
+|--------------------|---------|
+| BaseUrl | `https://hacker-news.firebaseio.com/v0/` |
+| RefreshInterval / ReconciliationInterval | `00:01:00` / `00:30:00` |
+| RequestTimeout / InitialLoadWaitTimeout | `00:00:10` / `00:00:15` |
+| MaxUpstreamConcurrency / UpdateBatchSize | `10` / `100` |
+| MaximumStoryCount | `100` (memory snapshot and synchronous count ceiling) |
+| StreamReconnectDelay / StreamIdleTimeout | `00:00:05` / `00:01:00` |
+
+| Exports setting | Default |
+|-----------------|---------|
+| MaximumCount / MaximumActiveJobs | `1000000` / `10` |
+| MaximumReservedRows | `2000000` (requested rows while active; actual rows after success) |
+| ChunkSize / MaximumPageSize | `500` / `1000`; chunk must not exceed page ceiling |
+| MaximumResponseBytes | `1048576`; minimum 4096, 2 KiB reserved for envelope/token |
+| JobDeadline / PollInterval | `00:30:00` including queue time / `00:00:05` |
+| Retention / TombstoneRetention | `1.00:00:00` each |
+
+Cleanup releases expired/failed rows and idempotency mappings; tombstones remain
+for the additional retention period. MaximumReservedRows must cover MaximumCount.
+Row quotas are not disk-byte quotas.
 
 ## Tests
 
+Default tests use fake HTTP, test-only storage, TimeProvider, and synchronization
+gates; no test calls Hacker News. Coverage includes validation, SSE, concurrency,
+snapshot isolation, recovery, transactions, frozen paging, tokens, quotas, and cleanup.
+
 ```powershell
-dotnet test
 dotnet test tests\HackerNews.Api.Tests --filter "FullyQualifiedName~SnapshotTests.GetBest_UnsortedUpstream_MapsSortsAndLimits"
-```
-
-Default tests use a **test-only** transactional state model and fake HTTP handlers.
-Real PostgreSQL tests are explicitly skipped without HACKERNEWS_TEST_POSTGRES.
-To include them, use the local disposable development database server with an
-account allowed to create/drop databases:
-
-```powershell
+# Optional real PostgreSQL tests: local disposable server; role needs CREATE/DROP DATABASE.
 $env:HACKERNEWS_TEST_POSTGRES = "Host=localhost;Port=5432;Database=hackernews;Username=hackernews;Password=<password>;Timeout=5;Command Timeout=30"
 dotnet test
-Remove-Item Env:\HACKERNEWS_TEST_POSTGRES
-```
-
-Each database test creates a unique `hn_test_<guid>` database and deletes only that
-database afterward. Never point tests at an externally managed production server.
-Tests cover restart without upstream reads, versioned pending work, interrupted
-bootstrap/reconciliation, transaction rollback, owner/source/schema checks, corrupted
-snapshot, PostgreSQL health, plus HTTP validation, bounded concurrency, snapshot
-isolation, SSE parsing/reconnects, and >100 concurrent callers. TimeProvider, gates,
-and channels replace arbitrary test sleeps. Tests never call public Hacker News.
-
-Export tests additionally cover durable checkpoints/freeze rollback, concurrent
-idempotency and processing, quotas, expiration/tombstones, frozen order/values,
-restart-safe token traversal, oversized records, exact page bytes, and worker
-non-overlap. A separate opt-in synthetic million-record fixture creates its own
-isolated database and records elapsed time/managed allocations:
-
-```powershell
-# Set HACKERNEWS_TEST_POSTGRES as above first.
+# Optional isolated synthetic million-row fixture:
 $env:HACKERNEWS_EXPORT_SCALE_TESTS = "1"
 dotnet test tests\HackerNews.Api.Tests --filter "FullyQualifiedName~Export_MillionSyntheticRecords" --logger "console;verbosity=normal"
 Remove-Item Env:\HACKERNEWS_EXPORT_SCALE_TESTS
+Remove-Item Env:\HACKERNEWS_TEST_POSTGRES
 ```
 
-The fixture uses larger configured validation chunks (10,000), checks checkpoint
-ceilings and a bounded 1,000-row page, and never contacts Hacker News. Total managed
-allocations are not peak resident memory; this is a reproducible functional scale
-check, not a production load/throughput or memory-capacity certification.
+Database tests create/drop only unique hn_test databases; never target production.
+The scale fixture checks 10,000-row checkpoint and 1,000-row page bounds and reports
+elapsed time/total allocations, not peak memory or certified throughput.
 
-## Backup, restore, and upgrades
-
-For local manual backup without putting credentials in tracked files:
+## Operations and limitations
 
 ```powershell
+docker compose logs --tail 50 api
+docker compose exec db pg_isready -U hackernews -d hackernews
+docker compose restart api
 docker compose exec db pg_dump -U hackernews -d hackernews -Fc -f /tmp/hackernews.dump
 docker compose cp db:/tmp/hackernews.dump .\hackernews.dump
 ```
 
-Store dumps securely outside the source tree. To restore into an empty replacement
-database, stop the API first, copy the dump into the database container, and use
-`pg_restore -U hackernews -d hackernews --exit-on-error /tmp/hackernews.dump`.
-Do not restore over a live ingestion instance or use destructive restore flags
-without intentionally approving replacement. Changing POSTGRES_PASSWORD in `.env`
-does not change an existing database role's password; rotate it explicitly.
+Ordinary `docker compose down` preserves beststories_postgres-data.
+**`down --volumes` deletes acquired data.** The volume does not protect against host
+loss. Store dumps securely; restore only into an empty replacement database with the
+API stopped using `pg_restore -U hackernews -d hackernews --exit-on-error`.
+Changing `.env` does not rotate an existing PostgreSQL role password.
 
-Version 1 creates acquisition tables; version 2 adds the durable publication generation.
-Both run transactionally. Future migrations must
-increment/validate schema_version and preserve durable work. PostgreSQL major-version
-upgrades require a tested migration or dump/restore, not just changing the image tag
-against the same data directory. Configure production TLS, managed credentials,
-least-privilege roles, durable volumes, scheduled backups, and restore drills.
-Compose's database bootstrap role is suitable only for local development.
+Acquisition schema v1 creates tables; v2 adds generation; export schema is v1.
+Future migrations must preserve work. Major PostgreSQL upgrades require tested
+migration/dump-restore, not an image-tag-only change. Production needs TLS,
+least-privilege credentials, durable storage, backup schedules, and restore drills.
+Compose's bootstrap role is for development. Configure HTTP health probes separately;
+Compose --wait alone does not establish API readiness.
 
-## Limitations and future work
-
-PostgreSQL is an explicitly approved extension to the original no-database assignment.
-This remains a single-ingestion-instance deployment. No Redis, message broker, generic
-repository framework, authentication, or live-dataset pagination has been added.
-Large results use the separate asynchronous export API described above.
-
-Persistence avoids restarting a million-item acquisition, but does not eliminate
-initial acquisition or reconciliation. Only a bounded top snapshot is kept in memory;
-the full best-story **ID list** still must be fetched/handled in memory for membership
-comparison. Reconciliation enqueues rows in the database, which can create substantial
-write work at large scale. No million-record throughput claim is made.
-Batch/concurrency limits are not a strict requests-per-second budget. If incoming
-changes exceed processing capacity, backlog and stale age grow. Defaults optimize
-for the real small best-story list, not a hypothetical million-item API.
-Count increases do not enlarge the source's candidate list.
-
-Future work: async exports (separate plan), explicit rate/freshness budgets, metrics,
-fenced multi-node ownership, source membership streaming if required, controlled
-large-dataset measurements, and deployment-specific security/backup automation.
+The full membership ID list is still handled in memory. Acquisition/reconciliation
+still cost upstream calls; concurrency/batch limits are not a strict rate limit.
+Backlogs can grow, and publication age is not per-story freshness. Atomic export
+freezes/cleanup can consume substantial WAL/disk and delay admission. No million-row
+production capacity guarantee, artifact reuse, Redis, broker, multi-node ingestion
+failover, authentication, or cancellation is provided.

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using HackerNews.Api.Exports;
+using HackerNews.Api.Models;
 using Microsoft.Extensions.Options;
 using Npgsql;
 
@@ -81,8 +82,13 @@ public static class ExportEndpoints
         try
         {
             var operation = await store.GetAsync(id, cancellationToken);
-            return operation is null ? NotFound()
-                : operation.Status == "expired" ? Expired() : Results.Ok(operation);
+
+            if (operation is null)
+            {
+                return NotFound();
+            }
+
+            return operation.Status == "expired" ? Expired() : Results.Ok(operation);
         }
         catch (NpgsqlException exception)
         {
@@ -122,69 +128,92 @@ public static class ExportEndpoints
             {
                 return NotFound();
             }
+
             if (operation.Status == "expired")
             {
                 return Expired();
             }
+
             if (operation.Status != "succeeded")
             {
                 return Results.Problem(statusCode: 409, title: "Export results are not available",
                     detail: "Read the operation status; only succeeded operations expose results.");
             }
+
             if (cursor is not null && (cursor.Generation != operation.DatasetGeneration ||
                 cursor.Position >= operation.ResultCount || cursor.ExpiresUnixSeconds != operation.ExpiresAt!.Value.ToUnixTimeSeconds()))
             {
                 return InvalidToken();
             }
+
             var items = rows.Stories.ToList();
             if (items.Count == 0 && operation.ResultCount > (cursor?.Position ?? 0))
             {
                 logging.CreateLogger("ExportEndpoints").LogError("Export {OperationId} has no readable next row within the response budget", id);
                 return Results.Problem(statusCode: 503, title: "Export result rows unavailable");
             }
-            byte[] Serialize(int count)
-            {
-                var position = (cursor?.Position ?? 0) + count;
-                var next = position < operation.ResultCount
-                    ? tokens.Protect(new(1, id, operation.DatasetGeneration!.Value, position, size,
-                        operation.ExpiresAt!.Value.ToUnixTimeSeconds()))
-                    : null;
-                return JsonSerializer.SerializeToUtf8Bytes(new ExportPage(id, items.Take(count).ToArray(), next), ExportJson.Options);
-            }
-            var bytes = Serialize(items.Count);
-            if (bytes.Length <= settings.MaximumResponseBytes)
-            {
-                return Results.Bytes(bytes, "application/json");
-            }
-            byte[]? best = null;
-            var low = 1;
-            var high = items.Count - 1;
-            while (low <= high)
-            {
-                var middle = low + (high - low) / 2;
-                var candidate = Serialize(middle);
-                if (candidate.Length <= settings.MaximumResponseBytes)
-                {
-                    best = candidate;
-                    low = middle + 1;
-                }
-                else
-                {
-                    high = middle - 1;
-                }
-            }
-            if (best is not null)
-            {
-                return Results.Bytes(best, "application/json");
-            }
-            logging.CreateLogger("ExportEndpoints").LogError("Export {OperationId} cannot fit one record within the response budget", id);
-            return Results.Problem(statusCode: 503, title: "Result response exceeds the configured byte budget");
+            return CreatePageResult(operation, items, cursor?.Position ?? 0, size, tokens,
+                settings.MaximumResponseBytes, logging.CreateLogger("ExportEndpoints"));
         }
         catch (NpgsqlException exception)
         {
             logging.CreateLogger("ExportEndpoints").LogError(exception, "Unable to read export results {OperationId}", id);
             return Unavailable();
         }
+    }
+
+    private static IResult CreatePageResult(ExportStatus operation, IReadOnlyList<StoryResponse> items,
+        int startPosition, int pageSize, ExportTokens tokens, int maximumBytes, ILogger logger)
+    {
+        byte[] Serialize(int count) =>
+            SerializePage(operation, items, count, startPosition, pageSize, tokens);
+
+        var bytes = Serialize(items.Count);
+        if (bytes.Length <= maximumBytes)
+        {
+            return Results.Bytes(bytes, "application/json");
+        }
+        byte[]? best = null;
+        var low = 1;
+        var high = items.Count - 1;
+        while (low <= high)
+        {
+            var middle = low + (high - low) / 2;
+            var candidate = Serialize(middle);
+            if (candidate.Length <= maximumBytes)
+            {
+                best = candidate;
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle - 1;
+            }
+        }
+        if (best is not null)
+        {
+            return Results.Bytes(best, "application/json");
+        }
+        logger.LogError("Export {OperationId} cannot fit one record within the response budget", operation.OperationId);
+        return Results.Problem(statusCode: 503, title: "Result response exceeds the configured byte budget");
+    }
+
+    private static byte[] SerializePage(ExportStatus operation, IReadOnlyList<StoryResponse> items,
+        int count, int startPosition, int pageSize, ExportTokens tokens)
+    {
+        var nextPosition = startPosition + count;
+        var continuationToken = nextPosition < operation.ResultCount
+            ? tokens.Protect(new ExportCursor(
+                Version: 1,
+                OperationId: operation.OperationId,
+                Generation: operation.DatasetGeneration!.Value,
+                Position: nextPosition,
+                PageSize: pageSize,
+                ExpiresUnixSeconds: operation.ExpiresAt!.Value.ToUnixTimeSeconds()))
+            : null;
+
+        var page = new ExportPage(operation.OperationId, items.Take(count).ToArray(), continuationToken);
+        return JsonSerializer.SerializeToUtf8Bytes(page, ExportJson.Options);
     }
 
     private static IResult InvalidToken() => Results.Problem(statusCode: 400, title: "Invalid or expired continuation token");

@@ -23,14 +23,47 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
             {
                 return await ReadSnapshotAsync(Connection, maximumCount, cancellationToken);
             }
+
             owner = await dataSource.OpenConnectionAsync(cancellationToken);
-            await using var acquire = Command("SELECT pg_try_advisory_lock($1)", owner, OwnerLock);
-            if (await acquire.ExecuteScalarAsync(cancellationToken) is not true)
-            {
-                throw new InvalidOperationException("Another ingestion instance already owns this database.");
-            }
+            await AcquireOwnershipAsync(owner, cancellationToken);
+
             await using var transaction = await owner.BeginTransactionAsync(cancellationToken);
-            await using (var schema = Command("""
+            await InitializeSchemaAsync(owner, source, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+
+            initialized = true;
+            return await ReadSnapshotAsync(owner, maximumCount, cancellationToken);
+        }
+        catch
+        {
+            if (!initialized && owner is not null)
+            {
+                await owner.DisposeAsync();
+                owner = null;
+            }
+
+            throw;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static async Task AcquireOwnershipAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = Command("SELECT pg_try_advisory_lock($1)", connection, OwnerLock);
+
+        if (await command.ExecuteScalarAsync(cancellationToken) is not true)
+        {
+            throw new InvalidOperationException("Another ingestion instance already owns this database.");
+        }
+    }
+
+    private static async Task InitializeSchemaAsync(NpgsqlConnection connection, string source,
+        CancellationToken cancellationToken)
+    {
+        await using (var schema = Command("""
                 CREATE TABLE IF NOT EXISTS hn_state (
                     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
                     schema_version integer NOT NULL,
@@ -39,26 +72,38 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
                     generation bigint NOT NULL DEFAULT 0,
                     snapshot jsonb
                 );
-                """, owner))
-            {
-                await schema.ExecuteNonQueryAsync(cancellationToken);
-            }
-            await using (var insert = Command("""
+                """, connection))
+        {
+            await schema.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await using (var insert = Command("""
                 INSERT INTO hn_state (singleton, schema_version, source)
                 VALUES (true, 1, $1) ON CONFLICT DO NOTHING;
-                """, owner, source))
+                """, connection, source))
+        {
+            await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await ValidateSourceAsync(connection, source, cancellationToken);
+        await MigrateCandidatesAsync(connection, cancellationToken);
+    }
+    private static async Task ValidateSourceAsync(NpgsqlConnection connection, string source,
+        CancellationToken cancellationToken)
+    {
+        await using (var identity = Command("SELECT schema_version, source FROM hn_state WHERE singleton;", connection))
+        await using (var reader = await identity.ExecuteReaderAsync(cancellationToken))
+        {
+            if (!await reader.ReadAsync(cancellationToken) || reader.GetInt32(0) is not (1 or 2) || reader.GetString(1) != source)
             {
-                await insert.ExecuteNonQueryAsync(cancellationToken);
+                throw new InvalidOperationException("Persisted Hacker News schema or source identity is incompatible.");
             }
-            await using (var identity = Command("SELECT schema_version, source FROM hn_state WHERE singleton;", owner))
-            await using (var reader = await identity.ExecuteReaderAsync(cancellationToken))
-            {
-                if (!await reader.ReadAsync(cancellationToken) || reader.GetInt32(0) is not (1 or 2) || reader.GetString(1) != source)
-                {
-                    throw new InvalidOperationException("Persisted Hacker News schema or source identity is incompatible.");
-                }
-            }
-            await using (var migration = Command("""
+        }
+
+    }
+
+    private static async Task MigrateCandidatesAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using (var migration = Command("""
                 CREATE SEQUENCE IF NOT EXISTS hn_work_order;
                 CREATE TABLE IF NOT EXISTS hn_candidates (
                     id bigint PRIMARY KEY CHECK (id > 0),
@@ -76,26 +121,9 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
                     WHERE version > processed_version;
                 ALTER TABLE hn_state ADD COLUMN IF NOT EXISTS generation bigint NOT NULL DEFAULT 0;
                 UPDATE hn_state SET schema_version = 2 WHERE singleton AND schema_version = 1;
-                """, owner))
-            {
-                await migration.ExecuteNonQueryAsync(cancellationToken);
-            }
-            await transaction.CommitAsync(cancellationToken);
-            initialized = true;
-            return await ReadSnapshotAsync(owner, maximumCount, cancellationToken);
-        }
-        catch
+                """, connection))
         {
-            if (!initialized && owner is not null)
-            {
-                await owner.DisposeAsync();
-                owner = null;
-            }
-            throw;
-        }
-        finally
-        {
-            gate.Release();
+            await migration.ExecuteNonQueryAsync(cancellationToken);
         }
     }
 
@@ -105,6 +133,7 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
         {
             return;
         }
+
         await gate.WaitAsync(cancellationToken);
         try
         {
@@ -129,45 +158,73 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
         {
             var connection = Connection;
             await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-            await using var delete = Command("DELETE FROM hn_candidates WHERE NOT (id = ANY($1));", connection, membership);
-            var deleted = await delete.ExecuteNonQueryAsync(cancellationToken);
-            await using var add = Command("""
-                INSERT INTO hn_candidates (id) SELECT DISTINCT unnest($1::bigint[])
-                ON CONFLICT DO NOTHING;
-                """, connection, membership);
-            var added = await add.ExecuteNonQueryAsync(cancellationToken);
-            await using var reconcile = Command("""
-                UPDATE hn_state SET reconciliation_at = $1
-                WHERE singleton AND ($2 OR reconciliation_at IS NULL OR reconciliation_at <= $3)
-                RETURNING singleton;
-                """, connection, now, forceRefresh, now - reconciliationInterval);
-            if (await reconcile.ExecuteScalarAsync(cancellationToken) is true)
-            {
-                await using var queue = Command("""
-                    UPDATE hn_candidates SET version = version + 1, work_order = nextval('hn_work_order')
-                    WHERE version = processed_version;
-                    """, connection);
-                await queue.ExecuteNonQueryAsync(cancellationToken);
-            }
-            await using var select = Command("""
-                SELECT id, version FROM hn_candidates WHERE version > processed_version
-                ORDER BY work_order, id LIMIT $1;
-                """, connection, batchSize);
-            var work = new List<PendingStory>();
-            await using (var reader = await select.ExecuteReaderAsync(cancellationToken))
-            {
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    work.Add(new PendingStory(reader.GetInt64(0), reader.GetInt64(1)));
-                }
-            }
+
+            var membershipChanged = await UpdateMembershipAsync(connection, membership, cancellationToken);
+            await QueueReconciliationAsync(connection, now, reconciliationInterval, forceRefresh, cancellationToken);
+            var work = await ReadPendingWorkAsync(connection, batchSize, cancellationToken);
+
             await transaction.CommitAsync(cancellationToken);
-            return new StoryBatch(work, added > 0 || deleted > 0);
+            return new StoryBatch(work, membershipChanged);
         }
         finally
         {
             gate.Release();
         }
+    }
+
+    private static async Task<bool> UpdateMembershipAsync(NpgsqlConnection connection, long[] membership,
+        CancellationToken cancellationToken)
+    {
+        await using var delete = Command("DELETE FROM hn_candidates WHERE NOT (id = ANY($1));", connection, membership);
+        var deleted = await delete.ExecuteNonQueryAsync(cancellationToken);
+
+        await using var add = Command("""
+                INSERT INTO hn_candidates (id) SELECT DISTINCT unnest($1::bigint[])
+                ON CONFLICT DO NOTHING;
+                """, connection, membership);
+        var added = await add.ExecuteNonQueryAsync(cancellationToken);
+
+        return added > 0 || deleted > 0;
+    }
+
+    private static async Task QueueReconciliationAsync(NpgsqlConnection connection, DateTimeOffset now,
+        TimeSpan reconciliationInterval, bool forceRefresh, CancellationToken cancellationToken)
+    {
+        await using var reconcile = Command("""
+                UPDATE hn_state SET reconciliation_at = $1
+                WHERE singleton AND ($2 OR reconciliation_at IS NULL OR reconciliation_at <= $3)
+                RETURNING singleton;
+                """, connection, now, forceRefresh, now - reconciliationInterval);
+
+        if (await reconcile.ExecuteScalarAsync(cancellationToken) is not true)
+        {
+            return;
+        }
+
+        await using var queue = Command("""
+                    UPDATE hn_candidates SET version = version + 1, work_order = nextval('hn_work_order')
+                    WHERE version = processed_version;
+                    """, connection);
+        await queue.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task<List<PendingStory>> ReadPendingWorkAsync(NpgsqlConnection connection, int batchSize,
+        CancellationToken cancellationToken)
+    {
+        await using var select = Command("""
+                SELECT id, version FROM hn_candidates WHERE version > processed_version
+                ORDER BY work_order, id LIMIT $1;
+                """, connection, batchSize);
+        var work = new List<PendingStory>();
+        await using (var reader = await select.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                work.Add(new PendingStory(reader.GetInt64(0), reader.GetInt64(1)));
+            }
+        }
+
+        return work;
     }
 
     public async Task<StorySnapshot?> CommitBatchAsync(StoryBatch batch, IReadOnlyCollection<StoryFetchResult> results,
@@ -178,52 +235,14 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
         {
             var connection = Connection;
             await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-            await using var updates = new NpgsqlBatch(connection, transaction);
-            foreach (var result in results)
-            {
-                var update = new NpgsqlBatchCommand(result.Succeeded
-                    ? """
-                      UPDATE hn_candidates SET story = $1::jsonb, score = $2, acquired_at = $3,
-                          processed_version = $4,
-                          work_order = CASE WHEN version = $4 THEN NULL ELSE nextval('hn_work_order') END
-                      WHERE id = $5;
-                      """
-                    : "UPDATE hn_candidates SET work_order = nextval('hn_work_order') WHERE id = $1;");
-                if (result.Succeeded)
-                {
-                    update.Parameters.Add(new NpgsqlParameter { Value = result.Story is null ? DBNull.Value : JsonSerializer.Serialize(result.Story), NpgsqlDbType = NpgsqlDbType.Text });
-                    update.Parameters.Add(new NpgsqlParameter { Value = result.Story is null ? DBNull.Value : result.Story.Score, NpgsqlDbType = NpgsqlDbType.Integer });
-                    update.Parameters.Add(new NpgsqlParameter { Value = now });
-                    update.Parameters.Add(new NpgsqlParameter { Value = result.Work.Version });
-                }
-                update.Parameters.Add(new NpgsqlParameter { Value = result.Work.Id });
-                updates.BatchCommands.Add(update);
-            }
-            if (updates.BatchCommands.Count > 0)
-            {
-                await updates.ExecuteNonQueryAsync(cancellationToken);
-            }
 
-            StorySnapshot? snapshot;
-            if (batch.MembershipChanged || results.Any(result => result.Succeeded))
-            {
-                var stories = await ReadTopAsync(connection, maximumCount, cancellationToken);
-                if (stories.Length > 0)
-                {
-                    snapshot = new StorySnapshot(stories, now);
-                    await using var publish = Command("UPDATE hn_state SET snapshot = $1::jsonb, generation = generation + 1 WHERE singleton;",
-                        connection, JsonSerializer.Serialize(snapshot));
-                    await publish.ExecuteNonQueryAsync(cancellationToken);
-                }
-                else
-                {
-                    snapshot = await ReadSnapshotAsync(connection, maximumCount, cancellationToken);
-                }
-            }
-            else
-            {
-                snapshot = await ReadSnapshotAsync(connection, maximumCount, cancellationToken);
-            }
+            await WriteResultsAsync(connection, transaction, results, now, cancellationToken);
+
+            var datasetChanged = batch.MembershipChanged || results.Any(result => result.Succeeded);
+            var snapshot = datasetChanged
+                ? await PublishSnapshotAsync(connection, now, maximumCount, cancellationToken)
+                : await ReadSnapshotAsync(connection, maximumCount, cancellationToken);
+
             await transaction.CommitAsync(cancellationToken);
             return snapshot;
         }
@@ -231,6 +250,73 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
         {
             gate.Release();
         }
+    }
+
+    private static async Task WriteResultsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction,
+        IReadOnlyCollection<StoryFetchResult> results, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var updates = new NpgsqlBatch(connection, transaction);
+
+        foreach (var result in results)
+        {
+            updates.BatchCommands.Add(CreateResultCommand(result, now));
+        }
+
+        if (updates.BatchCommands.Count > 0)
+        {
+            await updates.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static NpgsqlBatchCommand CreateResultCommand(StoryFetchResult result, DateTimeOffset now)
+    {
+        if (!result.Succeeded)
+        {
+            var retry = new NpgsqlBatchCommand("UPDATE hn_candidates SET work_order = nextval('hn_work_order') WHERE id = $1;");
+            retry.Parameters.Add(new NpgsqlParameter { Value = result.Work.Id });
+            return retry;
+        }
+
+        var update = new NpgsqlBatchCommand("""
+                      UPDATE hn_candidates SET story = $1::jsonb, score = $2, acquired_at = $3,
+                          processed_version = $4,
+                          work_order = CASE WHEN version = $4 THEN NULL ELSE nextval('hn_work_order') END
+                      WHERE id = $5;
+                      """);
+        update.Parameters.Add(new NpgsqlParameter
+        {
+            Value = result.Story is null ? DBNull.Value : JsonSerializer.Serialize(result.Story),
+            NpgsqlDbType = NpgsqlDbType.Text
+        });
+        update.Parameters.Add(new NpgsqlParameter
+        {
+            Value = result.Story is null ? DBNull.Value : result.Story.Score,
+            NpgsqlDbType = NpgsqlDbType.Integer
+        });
+        update.Parameters.Add(new NpgsqlParameter { Value = now });
+        update.Parameters.Add(new NpgsqlParameter { Value = result.Work.Version });
+        update.Parameters.Add(new NpgsqlParameter { Value = result.Work.Id });
+
+        return update;
+    }
+
+    private static async Task<StorySnapshot?> PublishSnapshotAsync(NpgsqlConnection connection,
+        DateTimeOffset now, int maximumCount, CancellationToken cancellationToken)
+    {
+        var stories = await ReadTopAsync(connection, maximumCount, cancellationToken);
+
+        if (stories.IsEmpty)
+        {
+            return await ReadSnapshotAsync(connection, maximumCount, cancellationToken);
+        }
+
+        var snapshot = new StorySnapshot(stories, now);
+        await using var publish = Command(
+            "UPDATE hn_state SET snapshot = $1::jsonb, generation = generation + 1 WHERE singleton;",
+            connection, JsonSerializer.Serialize(snapshot));
+        await publish.ExecuteNonQueryAsync(cancellationToken);
+
+        return snapshot;
     }
 
     private NpgsqlConnection Connection => initialized && owner?.State == System.Data.ConnectionState.Open
@@ -253,9 +339,12 @@ public sealed class PostgresStoryStateStore(NpgsqlDataSource dataSource) : IStor
         {
             throw new JsonException("The durable serving snapshot must contain valid stories.");
         }
-        // A higher count must not silently serve fewer rows just because a previous process cached fewer.
         var top = await ReadTopAsync(connection, maximumCount, cancellationToken);
-        return new StorySnapshot(top.IsEmpty ? snapshot.Stories.Take(maximumCount).ToImmutableArray() : top, snapshot.LoadedAt);
+        var restoredStories = top.IsEmpty
+            ? snapshot.Stories.Take(maximumCount).ToImmutableArray()
+            : top;
+
+        return new StorySnapshot(restoredStories, snapshot.LoadedAt);
     }
 
     private static async Task<ImmutableArray<StoryResponse>> ReadTopAsync(NpgsqlConnection connection, int maximumCount,

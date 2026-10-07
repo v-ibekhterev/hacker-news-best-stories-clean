@@ -10,6 +10,7 @@ public sealed class PostgresExportStore(NpgsqlDataSource dataSource, IOptions<Ex
     TimeProvider timeProvider, ILogger<PostgresExportStore> logger) : IExportStore
 {
     private const long QueueLock = 684_103_828;
+    private const int ResponseEnvelopeBytes = 2048;
     private readonly ExportOptions settings = options.Value;
     private const string Columns = """
         id, status, requested_count, processed_count, result_count, created_at, updated_at,
@@ -79,40 +80,51 @@ public sealed class PostgresExportStore(NpgsqlDataSource dataSource, IOptions<Ex
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         await LockAsync(connection, cancellationToken);
         await CleanupAsync(connection, cancellationToken);
-        ExportStatus? prior = null;
-        await using (var existing = Command($"SELECT {Columns} FROM hn_exports WHERE idempotency_key = $1;",
-            connection, idempotencyKey))
-        await using (var reader = await existing.ExecuteReaderAsync(cancellationToken))
-        {
-            if (await reader.ReadAsync(cancellationToken))
-            {
-                prior = ReadStatus(reader);
-            }
-        }
+
+        var prior = await FindByIdempotencyKeyAsync(connection, idempotencyKey, cancellationToken);
+
         if (prior is not null)
         {
             await transaction.CommitAsync(cancellationToken);
             return prior.RequestedCount == count ? new(prior) : new(null, 409);
         }
-        var rejected = false;
-        await using (var capacity = Command("""
-            SELECT count(*) FILTER (WHERE status IN ('queued','inProgress')),
-                COALESCE(sum(reserved_rows), 0)::bigint FROM hn_exports;
-            """, connection))
-        await using (var reader = await capacity.ExecuteReaderAsync(cancellationToken))
-        {
-            await reader.ReadAsync(cancellationToken);
-            if (reader.GetInt64(0) >= settings.MaximumActiveJobs ||
-                reader.GetInt64(1) > settings.MaximumReservedRows - count)
-            {
-                rejected = true;
-            }
-        }
-        if (rejected)
+        if (!await HasCapacityAsync(connection, count, cancellationToken))
         {
             await transaction.CommitAsync(cancellationToken);
             return new(null, 429);
         }
+
+        var created = await InsertOperationAsync(connection, count, idempotencyKey, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return new(created);
+    }
+
+    private static async Task<ExportStatus?> FindByIdempotencyKeyAsync(NpgsqlConnection connection,
+        string idempotencyKey, CancellationToken cancellationToken)
+    {
+        await using var command = Command(
+            $"SELECT {Columns} FROM hn_exports WHERE idempotency_key = $1;", connection, idempotencyKey);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        return await reader.ReadAsync(cancellationToken) ? ReadStatus(reader) : null;
+    }
+
+    private async Task<bool> HasCapacityAsync(NpgsqlConnection connection, int count, CancellationToken cancellationToken)
+    {
+        await using var command = Command("""
+            SELECT count(*) FILTER (WHERE status IN ('queued','inProgress')),
+                COALESCE(sum(reserved_rows), 0)::bigint FROM hn_exports;
+            """, connection);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        return reader.GetInt64(0) < settings.MaximumActiveJobs &&
+            reader.GetInt64(1) <= settings.MaximumReservedRows - count;
+    }
+
+    private async Task<ExportStatus> InsertOperationAsync(NpgsqlConnection connection, int count,
+        string idempotencyKey, CancellationToken cancellationToken)
+    {
         var id = Guid.NewGuid();
         var now = timeProvider.GetUtcNow();
         await using var create = Command($"""
@@ -120,14 +132,10 @@ public sealed class PostgresExportStore(NpgsqlDataSource dataSource, IOptions<Ex
                 created_at, updated_at, deadline_at)
             VALUES ($1, $2, 'queued', $3, $3, $4, $4, $5) RETURNING {Columns};
             """, connection, id, idempotencyKey, count, now, now + settings.JobDeadline);
-        ExportStatus created;
-        await using (var reader = await create.ExecuteReaderAsync(cancellationToken))
-        {
-            await reader.ReadAsync(cancellationToken);
-            created = ReadStatus(reader);
-        }
-        await transaction.CommitAsync(cancellationToken);
-        return new(created);
+        await using var reader = await create.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        return ReadStatus(reader);
     }
 
     public async Task<ExportStatus?> GetAsync(Guid id, CancellationToken cancellationToken)
@@ -152,7 +160,7 @@ public sealed class PostgresExportStore(NpgsqlDataSource dataSource, IOptions<Ex
                         ORDER BY ordinal LIMIT $3
                     ) bounded
                 ) sized WHERE bytes <= $4 ORDER BY ordinal;
-                """, connection, id, position, pageSize, settings.MaximumResponseBytes - 2048);
+                """, connection, id, position, pageSize, settings.MaximumResponseBytes - ResponseEnvelopeBytes);
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
             {
@@ -169,29 +177,45 @@ public sealed class PostgresExportStore(NpgsqlDataSource dataSource, IOptions<Ex
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         await LockAsync(connection, cancellationToken);
         await CleanupAsync(connection, cancellationToken);
-        ExportStatus? operation = null;
-        await using (var select = Command($"""
-            SELECT {Columns} FROM hn_exports WHERE status IN ('queued','inProgress')
-            ORDER BY created_at, id LIMIT 1 FOR UPDATE;
-            """, connection))
-        await using (var reader = await select.ExecuteReaderAsync(cancellationToken))
-        {
-            if (await reader.ReadAsync(cancellationToken))
-            {
-                operation = ReadStatus(reader);
-            }
-        }
+        var operation = await FindNextOperationAsync(connection, cancellationToken);
+
         if (operation is null)
         {
             await transaction.CommitAsync(cancellationToken);
             return false;
         }
+
         var now = timeProvider.GetUtcNow();
+
         if (operation.Status == "queued")
         {
-            // One PostgreSQL statement freezes both values/ranking and generation from one MVCC view.
-            // All row copying happens server-side; no million-row buffer is held by the application.
-            await using var freeze = Command("""
+            await FreezeResultsAsync(connection, operation, now, cancellationToken);
+        }
+        else
+        {
+            await ValidateNextChunkAsync(connection, operation, now, cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        return true;
+    }
+
+    private static async Task<ExportStatus?> FindNextOperationAsync(NpgsqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command($"""
+            SELECT {Columns} FROM hn_exports WHERE status IN ('queued','inProgress')
+            ORDER BY created_at, id LIMIT 1 FOR UPDATE;
+            """, connection);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        return await reader.ReadAsync(cancellationToken) ? ReadStatus(reader) : null;
+    }
+
+    private async Task FreezeResultsAsync(NpgsqlConnection connection, ExportStatus operation,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var freeze = Command("""
                 WITH selected AS MATERIALIZED (
                     SELECT id, story, score FROM hn_candidates WHERE story IS NOT NULL
                     ORDER BY score DESC, id ASC LIMIT $2
@@ -204,65 +228,87 @@ public sealed class PostgresExportStore(NpgsqlDataSource dataSource, IOptions<Ex
                     dataset_generation = (SELECT generation FROM hn_state WHERE singleton), updated_at = $3
                 WHERE id = $1;
                 """, connection, operation.OperationId, operation.RequestedCount, now);
-            freeze.CommandTimeout = (int)Math.Ceiling(settings.JobDeadline.TotalSeconds);
-            await freeze.ExecuteNonQueryAsync(cancellationToken);
-        }
-        else
+        freeze.CommandTimeout = (int)Math.Ceiling(settings.JobDeadline.TotalSeconds);
+        await freeze.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private async Task ValidateNextChunkAsync(NpgsqlConnection connection, ExportStatus operation,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var (processed, failure) = await ReadValidatedChunkAsync(connection, operation, cancellationToken);
+
+        if (failure is not null)
         {
-            var processed = operation.ProcessedCount;
-            string? failure = null;
-            await using (var chunk = Command("""
+            logger.LogWarning("Export {OperationId} failed: {ErrorCode}", operation.OperationId, failure);
+            await FailAsync(connection, operation.OperationId, failure, cancellationToken);
+            return;
+        }
+
+        await SaveCheckpointAsync(connection, operation, processed, now, cancellationToken);
+    }
+
+    private async Task<(int Processed, string? Failure)> ReadValidatedChunkAsync(NpgsqlConnection connection,
+        ExportStatus operation, CancellationToken cancellationToken)
+    {
+        var processed = operation.ProcessedCount;
+        await using var chunk = Command("""
                 SELECT CASE WHEN octet_length(story::text) <= $4 THEN story::text ELSE NULL END
                 FROM hn_export_rows WHERE operation_id = $1 AND ordinal > $2
                 ORDER BY ordinal LIMIT $3;
-                """, connection, operation.OperationId, processed, settings.ChunkSize, settings.MaximumResponseBytes - 2048))
-            await using (var reader = await chunk.ExecuteReaderAsync(cancellationToken))
-            {
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    try
-                    {
-                        if (reader.IsDBNull(0))
-                        {
-                            failure = "recordTooLarge";
-                            break;
-                        }
-                        var story = ParseStory(reader.GetString(0));
-                        if (JsonSerializer.SerializeToUtf8Bytes(story, ExportJson.Options).Length + 2048 > settings.MaximumResponseBytes)
-                        {
-                            failure = "recordTooLarge";
-                            break;
-                        }
-                        processed++;
-                    }
-                    catch (JsonException exception)
-                    {
-                        logger.LogError(exception, "Export {OperationId} contains invalid persisted data", operation.OperationId);
-                        failure = "invalidDataset";
-                        break;
-                    }
-                }
-            }
+                """, connection, operation.OperationId, processed, settings.ChunkSize,
+                settings.MaximumResponseBytes - ResponseEnvelopeBytes);
+        await using var reader = await chunk.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var failure = ValidateResultRow(reader, operation.OperationId);
+
             if (failure is not null)
             {
-                logger.LogWarning("Export {OperationId} failed: {ErrorCode}", operation.OperationId, failure);
-                await FailAsync(connection, operation.OperationId, failure, cancellationToken);
+                return (processed, failure);
             }
-            else
-            {
-                var done = processed == operation.ResultCount;
-                await using var update = Command("""
+
+            processed++;
+        }
+
+        return (processed, null);
+    }
+
+    private string? ValidateResultRow(NpgsqlDataReader reader, Guid operationId)
+    {
+        if (reader.IsDBNull(0))
+        {
+            return "recordTooLarge";
+        }
+
+        try
+        {
+            var story = ParseStory(reader.GetString(0));
+            var serializedSize = JsonSerializer.SerializeToUtf8Bytes(story, ExportJson.Options).Length;
+
+            return serializedSize + ResponseEnvelopeBytes > settings.MaximumResponseBytes
+                ? "recordTooLarge"
+                : null;
+        }
+        catch (JsonException exception)
+        {
+            logger.LogError(exception, "Export {OperationId} contains invalid persisted data", operationId);
+            return "invalidDataset";
+        }
+    }
+
+    private async Task SaveCheckpointAsync(NpgsqlConnection connection, ExportStatus operation, int processed,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var done = processed == operation.ResultCount;
+        await using var update = Command("""
                     UPDATE hn_exports SET processed_count = $2, updated_at = $3,
                         status = CASE WHEN $4 THEN 'succeeded' ELSE 'inProgress' END,
                         expires_at = CASE WHEN $4 THEN $5 ELSE NULL END,
                         reserved_rows = CASE WHEN $4 THEN result_count ELSE reserved_rows END
                     WHERE id = $1;
                     """, connection, operation.OperationId, processed, now, done, now + settings.Retention);
-                await update.ExecuteNonQueryAsync(cancellationToken);
-            }
-        }
-        await transaction.CommitAsync(cancellationToken);
-        return true;
+        await update.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private async Task CleanupAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
@@ -327,16 +373,35 @@ public sealed class PostgresExportStore(NpgsqlDataSource dataSource, IOptions<Ex
         var id = reader.GetGuid(0);
         var status = reader.GetString(1);
         var code = reader.IsDBNull(9) ? null : reader.GetString(9);
-        return new(id, status, reader.GetInt32(2), reader.GetInt32(3),
-            reader.IsDBNull(4) ? null : reader.GetInt32(4), reader.GetFieldValue<DateTimeOffset>(5),
-            reader.GetFieldValue<DateTimeOffset>(6), reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7),
-            reader.IsDBNull(8) ? null : reader.GetInt64(8), status == "succeeded" ? $"/api/story-exports/{id}/results" : null,
-            code is null ? null : new(code, code switch
-            {
-                "deadlineExceeded" => "The export exceeded its processing deadline.",
-                "recordTooLarge" => "A story exceeds the configured result-response size budget.",
-                _ => "The persisted dataset contains an invalid story."
-            }));
+        return new ExportStatus(
+            OperationId: id,
+            Status: status,
+            RequestedCount: reader.GetInt32(2),
+            ProcessedCount: reader.GetInt32(3),
+            ResultCount: reader.IsDBNull(4) ? null : reader.GetInt32(4),
+            CreatedAt: reader.GetFieldValue<DateTimeOffset>(5),
+            LastUpdatedAt: reader.GetFieldValue<DateTimeOffset>(6),
+            ExpiresAt: reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7),
+            DatasetGeneration: reader.IsDBNull(8) ? null : reader.GetInt64(8),
+            ResultsPath: status == "succeeded" ? $"/api/story-exports/{id}/results" : null,
+            Error: CreateError(code));
+    }
+
+    private static ExportError? CreateError(string? code)
+    {
+        if (code is null)
+        {
+            return null;
+        }
+
+        var message = code switch
+        {
+            "deadlineExceeded" => "The export exceeded its processing deadline.",
+            "recordTooLarge" => "A story exceeds the configured result-response size budget.",
+            _ => "The persisted dataset contains an invalid story."
+        };
+
+        return new ExportError(code, message);
     }
 
     private static StoryResponse ParseStory(string json)

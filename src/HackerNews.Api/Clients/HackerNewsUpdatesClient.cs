@@ -22,42 +22,54 @@ public sealed class HackerNewsUpdatesClient(
 
     public async Task ListenAsync(Func<IReadOnlyCollection<long>, Task> onUpdated, CancellationToken cancellationToken)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, "updates.json");
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-        using var connectTimeout = new CancellationTokenSource(options.Value.RequestTimeout, timeProvider);
-        using var connecting = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, connectTimeout.Token);
-        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, connecting.Token);
-        connectTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
-        response.EnsureSuccessStatusCode();
-        if (response.Content.Headers.ContentType?.MediaType != "text/event-stream")
-        {
-            throw new HttpRequestException("Hacker News updates response is not an event stream.");
-        }
-
+        using var response = await OpenEventStreamAsync(cancellationToken);
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var reader = new StreamReader(stream);
+
+        await ReadEventsAsync(reader, onUpdated, cancellationToken);
+    }
+
+    private async Task<HttpResponseMessage> OpenEventStreamAsync(CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "updates.json");
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+
+        using var connectTimeout = new CancellationTokenSource(options.Value.RequestTimeout, timeProvider);
+        using var connecting = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, connectTimeout.Token);
+        var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, connecting.Token);
+        connectTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
+
+        try
+        {
+            response.EnsureSuccessStatusCode();
+
+            if (response.Content.Headers.ContentType?.MediaType != "text/event-stream")
+            {
+                throw new HttpRequestException("Hacker News updates response is not an event stream.");
+            }
+
+            return response;
+        }
+        catch
+        {
+            response.Dispose();
+            throw;
+        }
+    }
+
+    private async Task ReadEventsAsync(StreamReader reader, Func<IReadOnlyCollection<long>, Task> onUpdated,
+        CancellationToken cancellationToken)
+    {
         var data = new StringBuilder();
         var eventName = "";
+
         while (true)
         {
-            // Idle timeout includes keep-alives, not just item notifications.
-            using var idleTimeout = new CancellationTokenSource(options.Value.StreamIdleTimeout, timeProvider);
-            using var reading = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, idleTimeout.Token);
-            var line = await reader.ReadLineAsync(reading.Token);
-            if (line is null)
-            {
-                throw new IOException("Hacker News updates stream ended.");
-            }
+            var line = await ReadLineWithIdleTimeoutAsync(reader, cancellationToken);
+
             if (line.Length == 0)
             {
-                if (eventName is "cancel" or "auth_revoked")
-                {
-                    throw new HttpRequestException($"Hacker News updates stream signaled {eventName}.");
-                }
-                if (eventName is "put" or "patch")
-                {
-                    await onUpdated(ExtractItemIds(eventName, data.ToString()));
-                }
+                await DispatchEventAsync(eventName, data, onUpdated);
                 eventName = "";
                 data.Clear();
                 continue;
@@ -67,26 +79,63 @@ public sealed class HackerNewsUpdatesClient(
             {
                 continue;
             }
-            var separator = line.IndexOf(':');
-            var field = separator < 0 ? line : line[..separator];
-            var value = separator < 0 ? "" : line[(separator + 1)..];
-            if (value.StartsWith(' '))
-            {
-                value = value[1..];
-            }
+
+            var (field, value) = ParseField(line);
+
             if (field == "event")
             {
                 eventName = value;
             }
             else if (field == "data")
             {
-                if (data.Length + value.Length + 1 > MaximumEventCharacters)
-                {
-                    throw new JsonException("Hacker News updates event exceeds the size limit.");
-                }
-                data.Append(value).Append('\n');
+                AppendData(data, value);
             }
         }
+    }
+
+    private async Task<string> ReadLineWithIdleTimeoutAsync(StreamReader reader, CancellationToken cancellationToken)
+    {
+        using var idleTimeout = new CancellationTokenSource(options.Value.StreamIdleTimeout, timeProvider);
+        using var reading = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, idleTimeout.Token);
+
+        return await reader.ReadLineAsync(reading.Token)
+            ?? throw new IOException("Hacker News updates stream ended.");
+    }
+
+    private static Task DispatchEventAsync(string eventName, StringBuilder data,
+        Func<IReadOnlyCollection<long>, Task> onUpdated)
+    {
+        if (eventName is "cancel" or "auth_revoked")
+        {
+            throw new HttpRequestException($"Hacker News updates stream signaled {eventName}.");
+        }
+
+        return eventName is "put" or "patch"
+            ? onUpdated(ExtractItemIds(eventName, data.ToString()))
+            : Task.CompletedTask;
+    }
+
+    private static (string Field, string Value) ParseField(string line)
+    {
+        var separator = line.IndexOf(':');
+
+        if (separator < 0)
+        {
+            return (line, "");
+        }
+
+        var value = line[(separator + 1)..];
+        return (line[..separator], value.StartsWith(' ') ? value[1..] : value);
+    }
+
+    private static void AppendData(StringBuilder data, string value)
+    {
+        if (data.Length + value.Length + 1 > MaximumEventCharacters)
+        {
+            throw new JsonException("Hacker News updates event exceeds the size limit.");
+        }
+
+        data.Append(value).Append('\n');
     }
 
     internal static IReadOnlyCollection<long> ExtractItemIds(string eventName, string payload)
@@ -106,21 +155,22 @@ public sealed class HackerNewsUpdatesClient(
         }
 
         var ids = new HashSet<long>();
-        if (eventName == "patch")
-        {
-            if (data.ValueKind != JsonValueKind.Object)
-            {
-                throw new JsonException("Firebase patch data must be an object.");
-            }
-            foreach (var property in data.EnumerateObject())
-            {
-                ReadAtPath(path.TrimEnd('/') + "/" + property.Name, property.Value, ids);
-            }
-        }
-        else
+        if (eventName != "patch")
         {
             ReadAtPath(path, data, ids);
+            return ids;
         }
+
+        if (data.ValueKind != JsonValueKind.Object)
+        {
+            throw new JsonException("Firebase patch data must be an object.");
+        }
+
+        foreach (var property in data.EnumerateObject())
+        {
+            ReadAtPath(path.TrimEnd('/') + "/" + property.Name, property.Value, ids);
+        }
+
         return ids;
     }
 
