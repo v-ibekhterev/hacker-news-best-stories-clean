@@ -108,6 +108,98 @@ missing descendants becomes zero. Missing URL becomes null. Null, deleted, dead,
 non-story, missing title/author/time/score, and invalid timestamps are excluded.
 Unknown upstream JSON fields are ignored.
 
+## Asynchronous exports
+
+Exports read only the shared persisted candidate dataset; they never fetch upstream
+items. The synchronous endpoint and its count limit are unchanged. **Exports have no
+authentication: this deployment is local-only. Do not publish it on a public network.**
+An operation ID or idempotency key is not authorization. Authentication/ownership
+and per-caller rate limits must be added before public deployment.
+
+```powershell
+$request = @{ count = 1000000 } | ConvertTo-Json
+$created = Invoke-RestMethod -Method Post -Uri http://localhost:5080/api/story-exports `
+    -ContentType application/json -Headers @{ "Idempotency-Key" = [guid]::NewGuid().ToString() } -Body $request
+$id = $created.operationId
+Invoke-RestMethod "http://localhost:5080/api/story-exports/$id"
+# Once status is succeeded:
+$page = Invoke-RestMethod "http://localhost:5080/api/story-exports/$id/results?pageSize=1000"
+$page.items
+if ($page.nextContinuationToken) {
+    $token = [uri]::EscapeDataString($page.nextContinuationToken)
+    Invoke-RestMethod "http://localhost:5080/api/story-exports/$id/results?pageSize=1000&continuationToken=$token"
+}
+```
+
+| Route | Contract |
+|-------|----------|
+| `POST /api/story-exports` | JSON integer `count` in `1..Exports:MaximumCount`; one `Idempotency-Key` header, 1..128 printable ASCII characters without spaces. Returns 202 with operationId, status, statusPath, Location, and Retry-After: 5. |
+| `GET /api/story-exports/{id}` | 200 with status (`queued`, `inProgress`, `succeeded`, `failed`), requestedCount, processedCount, nullable resultCount, timestamps, nullable datasetGeneration, safe error, and resultsPath only on success. |
+| `GET /api/story-exports/{id}/results` | Completed frozen values only. Optional pageSize defaults to 100 (or the configured ceiling if smaller); optional continuationToken. Returns operationId, items, nextContinuationToken (null at end). |
+
+Malformed JSON/count/header/page size or invalid/tampered/expired tokens return
+400 ProblemDetails; non-JSON creation returns 415. Same key/count replays the existing
+operation; same key/different count returns 409. Idempotency keys are global in this
+unauthenticated deployment. Active-job or retained-row capacity exhaustion returns
+429 with Retry-After. Unknown operations return 404, incomplete/failed result retrieval
+409, expired operations 410 while tombstones remain, and storage unavailability 503.
+Expiration may return 404 after tombstone retention. Expired tokens return 400;
+query an operation without a token to distinguish expired results.
+
+The single background worker atomically freezes ranking **and values** using a
+server-side PostgreSQL INSERT/SELECT with one MVCC statement snapshot. Its source
+view is pinned when preparation begins, not when the request is queued; generation
+is null until that freeze commits. Exports succeed with fewer available records,
+including zero. They do not wait for acquisition to reach the requested count.
+Sort order is score descending, then story ID ascending.
+
+Freezing all selected rows is one database transaction, not a million-row application
+buffer or a resumable chunked source copy. An interrupted freeze rolls back and is
+retried against a fresh view. This avoids retaining upstream record versions or
+holding a database snapshot across restarts, at the cost of potentially substantial
+transaction duration, WAL, disk, and database sorting/spill work. After the freeze,
+bounded validation chunks durably advance processedCount. A restart resumes the last
+committed validation checkpoint against the same frozen rows; partial results stay
+private. Only a final committed checkpoint exposes success. Database queue locks
+serialize admission/processing checkpoints and make repeat execution safe; one worker
+is configured, and the existing single-ingestion-instance restriction remains.
+
+Result reads use indexed ordinals and bounded row/byte selection in one repeatable-read
+transaction, so cleanup cannot remove half a page. Pages can contain fewer than
+pageSize items to honor the **exact serialized JSON byte limit**. A single record that
+cannot fit, including a conservative 2 KiB envelope/token allowance, fails the export
+with `recordTooLarge` instead of producing unpageable results. Invalid persisted
+stories fail with `invalidDataset`; SQL failures are logged and retried until deadline.
+Accepted work survives request disconnects. No cancellation endpoint is implemented.
+
+HMAC-protected tokens bind version, operation, dataset generation, last ordinal,
+page size, and expiry. Keep pageSize unchanged when following a token. The signing key
+is generated once and stored in PostgreSQL, so container restarts and database
+backup/restore preserve tokens. Protect database access/backups; key rotation is not
+implemented. Restoring a backup also restores its jobs and signing key.
+
+| Exports setting | Default | Meaning |
+|-----------------|---------|---------|
+| MaximumCount | 1,000,000 | Requested-count ceiling |
+| MaximumActiveJobs | 10 | Queued + in-progress admission ceiling |
+| MaximumReservedRows | 2,000,000 | Global row budget: requested counts while active, actual counts when succeeded |
+| ChunkSize | 500 | Validation/checkpoint rows; positive, at most MaximumPageSize |
+| MaximumPageSize | 1,000 | Page-count ceiling |
+| MaximumResponseBytes | 1,048,576 | Exact serialized JSON page ceiling; minimum 4 KiB |
+| JobDeadline | 00:30:00 | From acceptance, including queue time; timeout fails and deletes private rows |
+| Retention | 1.00:00:00 | Results and idempotency mapping retained after success/failure |
+| TombstoneRetention | 1.00:00:00 | Additional expired metadata retention |
+| PollInterval | 00:00:05 | Idle/retry/cleanup cadence |
+
+Use the `Exports` configuration section or `Exports__...` environment variables.
+Limits and timer ranges are startup-validated. Cleanup runs on worker ticks and
+admission; failed/expired rows release reserved capacity, and expired mappings allow
+key reuse. A page started before cleanup sees a consistent retained view. Row budgets
+are **not disk-byte quotas**; monitor PostgreSQL disk/WAL space and size deployment
+storage for actual story widths. Queue locking can delay admission while a large
+freeze/cleanup runs. No throughput guarantee, artifact reuse, public abuse protection,
+or multi-node ingestion failover is implied.
+
 ## Durable acquisition and startup
 
 ```text
@@ -220,6 +312,24 @@ snapshot, PostgreSQL health, plus HTTP validation, bounded concurrency, snapshot
 isolation, SSE parsing/reconnects, and >100 concurrent callers. TimeProvider, gates,
 and channels replace arbitrary test sleeps. Tests never call public Hacker News.
 
+Export tests additionally cover durable checkpoints/freeze rollback, concurrent
+idempotency and processing, quotas, expiration/tombstones, frozen order/values,
+restart-safe token traversal, oversized records, exact page bytes, and worker
+non-overlap. A separate opt-in synthetic million-record fixture creates its own
+isolated database and records elapsed time/managed allocations:
+
+```powershell
+# Set HACKERNEWS_TEST_POSTGRES as above first.
+$env:HACKERNEWS_EXPORT_SCALE_TESTS = "1"
+dotnet test tests\HackerNews.Api.Tests --filter "FullyQualifiedName~Export_MillionSyntheticRecords" --logger "console;verbosity=normal"
+Remove-Item Env:\HACKERNEWS_EXPORT_SCALE_TESTS
+```
+
+The fixture uses larger configured validation chunks (10,000), checks checkpoint
+ceilings and a bounded 1,000-row page, and never contacts Hacker News. Total managed
+allocations are not peak resident memory; this is a reproducible functional scale
+check, not a production load/throughput or memory-capacity certification.
+
 ## Backup, restore, and upgrades
 
 For local manual backup without putting credentials in tracked files:
@@ -248,7 +358,8 @@ Compose's database bootstrap role is suitable only for local development.
 
 PostgreSQL is an explicitly approved extension to the original no-database assignment.
 This remains a single-ingestion-instance deployment. No Redis, message broker, generic
-repository framework, pagination, or async-export API has been added.
+repository framework, authentication, or live-dataset pagination has been added.
+Large results use the separate asynchronous export API described above.
 
 Persistence avoids restarting a million-item acquisition, but does not eliminate
 initial acquisition or reconciliation. Only a bounded top snapshot is kept in memory;

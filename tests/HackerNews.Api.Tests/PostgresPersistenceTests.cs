@@ -6,7 +6,7 @@ using Npgsql;
 
 namespace HackerNews.Api.Tests;
 
-public sealed class PostgresFactAttribute : FactAttribute
+public class PostgresFactAttribute : FactAttribute
 {
     public PostgresFactAttribute()
     {
@@ -17,7 +17,7 @@ public sealed class PostgresFactAttribute : FactAttribute
     }
 }
 
-public sealed class PostgresPersistenceTests : IAsyncLifetime
+public sealed partial class PostgresPersistenceTests : IAsyncLifetime
 {
     private string? database;
     private NpgsqlDataSource? dataSource;

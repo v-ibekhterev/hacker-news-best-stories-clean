@@ -11,6 +11,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Time.Testing;
 using HackerNews.Api.Storage;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using HackerNews.Api.Exports;
 
 namespace HackerNews.Api.Tests;
 
@@ -88,6 +89,9 @@ internal sealed class ApiFactory : WebApplicationFactory<Program>
 {
     public StubHandler Handler { get; } = new();
     public Action<HackerNewsOptions>? ConfigureOptions { get; init; }
+    public IExportStore ExportStore { get; init; } = new StubExportStore();
+    public Action<ExportOptions>? ConfigureExports { get; init; }
+    public TimeProvider Time { get; init; } = TimeProvider.System;
 
     protected override void ConfigureWebHost(IWebHostBuilder builder) =>
         builder.ConfigureServices(services =>
@@ -95,6 +99,14 @@ internal sealed class ApiFactory : WebApplicationFactory<Program>
             services.RemoveAll<IHostedService>();
             services.RemoveAll<IStoryStateStore>();
             services.AddSingleton<IStoryStateStore, MemoryStoryStateStore>();
+            services.RemoveAll<IExportStore>();
+            services.AddSingleton(ExportStore);
+            services.RemoveAll<TimeProvider>();
+            services.AddSingleton(Time);
+            if (ConfigureExports is not null)
+            {
+                services.PostConfigure(ConfigureExports);
+            }
             services.Configure<HealthCheckServiceOptions>(options =>
             {
                 var database = options.Registrations.Single(check => check.Name == "database");
