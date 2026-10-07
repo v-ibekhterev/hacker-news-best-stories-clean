@@ -3,3 +3,8 @@
 .vs/
 TestResults/
 *.user
+.env
+.env.*
+!.env.example
+*.dump
+.artifacts/

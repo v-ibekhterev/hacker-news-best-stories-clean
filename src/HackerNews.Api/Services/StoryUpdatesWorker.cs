@@ -2,6 +2,7 @@ using System.Text.Json;
 using HackerNews.Api.Clients;
 using HackerNews.Api.Configuration;
 using Microsoft.Extensions.Options;
+using Npgsql;
 
 namespace HackerNews.Api.Services;
 
@@ -14,6 +15,7 @@ public sealed class StoryUpdatesWorker(
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await stories.InitializeAsync();
         var delay = options.Value.StreamReconnectDelay;
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -21,10 +23,10 @@ public sealed class StoryUpdatesWorker(
             {
                 using var httpClient = clientFactory.CreateClient(nameof(HackerNewsUpdatesClient));
                 var client = new HackerNewsUpdatesClient(httpClient, options, timeProvider);
-                await client.ListenAsync(ids =>
+                await client.ListenAsync(async ids =>
                 {
                     delay = options.Value.StreamReconnectDelay;
-                    stories.MarkUpdated(ids);
+                    await stories.MarkUpdatedAsync(ids, stoppingToken);
                     logger.LogDebug("Received {ItemCount} item IDs from the updates stream", ids.Count);
                 }, stoppingToken);
             }
@@ -33,7 +35,7 @@ public sealed class StoryUpdatesWorker(
                 return;
             }
             catch (Exception exception) when (exception is HttpRequestException or IOException or JsonException or
-                                              OperationCanceledException or TimeoutException)
+                                              OperationCanceledException or TimeoutException or NpgsqlException)
             {
                 logger.LogWarning(exception, "Updates stream interrupted; reconnecting after {Delay}", delay);
             }

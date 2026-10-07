@@ -20,10 +20,10 @@ public sealed class IncrementalRefreshTests
         };
         await harness.Service.RefreshAsync();
         Assert.Null(harness.Service.Snapshot);
-        Assert.Equal(3, reads);
+        Assert.Equal(1, reads);
         await harness.Service.RefreshIncrementalAsync();
         Assert.Null(harness.Service.Snapshot);
-        Assert.Equal(4, reads);
+        Assert.Equal(2, reads);
     }
 
     [Fact]
@@ -36,7 +36,7 @@ public sealed class IncrementalRefreshTests
         });
         await harness.Service.RefreshAsync();
         var old = harness.Service.Snapshot!;
-        harness.Service.MarkUpdated([1, 2, 3]);
+        await harness.Service.MarkUpdatedAsync([1, 2, 3]);
         var entered = ServiceHarness.Gate();
         var release = ServiceHarness.Gate();
         int current = 0, maximum = 0, total = 0, membershipCalls = 0;
@@ -104,7 +104,7 @@ public sealed class IncrementalRefreshTests
         };
         var load = harness.Service.RefreshAsync();
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        harness.Service.MarkUpdated([1]);
+        await harness.Service.MarkUpdatedAsync([1]);
         release.SetResult();
         await load;
         await harness.Service.RefreshIncrementalAsync();
@@ -134,7 +134,7 @@ public sealed class IncrementalRefreshTests
     {
         using var harness = new ServiceHarness();
         await harness.Service.RefreshAsync();
-        harness.Service.MarkUpdated([2, 2, 999, 999]);
+        await harness.Service.MarkUpdatedAsync([2, 2, 999, 999]);
         var paths = new System.Collections.Concurrent.ConcurrentBag<string>();
         harness.Handler.Send = (request, _) =>
         {
@@ -155,7 +155,7 @@ public sealed class IncrementalRefreshTests
     {
         using var harness = new ServiceHarness();
         await harness.Service.RefreshAsync();
-        harness.Service.MarkUpdated([1]);
+        await harness.Service.MarkUpdatedAsync([1]);
         var paths = new List<string>();
         harness.Handler.Send = (request, _) =>
         {
@@ -175,7 +175,7 @@ public sealed class IncrementalRefreshTests
         using var harness = new ServiceHarness();
         await harness.Service.RefreshAsync();
         var old = harness.Service.Snapshot;
-        harness.Service.MarkUpdated([2]);
+        await harness.Service.MarkUpdatedAsync([2]);
         var entered = ServiceHarness.Gate();
         var release = ServiceHarness.Gate();
         var calls = 0;
@@ -195,7 +195,7 @@ public sealed class IncrementalRefreshTests
         };
         var refresh = harness.Service.RefreshIncrementalAsync();
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        harness.Service.MarkUpdated([2]);
+        await harness.Service.MarkUpdatedAsync([2]);
         Assert.Same(old, harness.Service.Snapshot);
         release.SetResult();
         await refresh;
@@ -214,7 +214,7 @@ public sealed class IncrementalRefreshTests
     {
         using var harness = new ServiceHarness();
         await harness.Service.RefreshAsync();
-        harness.Service.MarkUpdated([3]);
+        await harness.Service.MarkUpdatedAsync([3]);
         harness.Handler.Send = (request, _) => Task.FromResult(request.RequestUri!.AbsolutePath.EndsWith("beststories.json")
             ? StubHandler.Json(new long[] { 1, 2, 3 })
             : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(payload) });
@@ -228,7 +228,7 @@ public sealed class IncrementalRefreshTests
         using var harness = new ServiceHarness();
         await harness.Service.RefreshAsync();
         var old = harness.Service.Snapshot;
-        harness.Service.MarkUpdated([3]);
+        await harness.Service.MarkUpdatedAsync([3]);
         harness.Handler.Send = (request, _) => Task.FromResult(request.RequestUri!.AbsolutePath.EndsWith("beststories.json")
             ? StubHandler.Json(new long[] { 1, 2, 3 })
             : new HttpResponseMessage(HttpStatusCode.BadGateway));
@@ -254,7 +254,7 @@ public sealed class IncrementalRefreshTests
     {
         using var harness = new ServiceHarness();
         await harness.Service.RefreshAsync();
-        harness.Service.MarkUpdated([1]);
+        await harness.Service.MarkUpdatedAsync([1]);
         harness.Handler.Send = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadGateway));
         await harness.Service.RefreshIncrementalAsync();
         var paths = new List<string>();
@@ -301,7 +301,9 @@ public sealed class IncrementalRefreshTests
     {
         using var harness = new ServiceHarness(settings => settings.UpdateBatchSize = 1);
         await harness.Service.RefreshAsync();
-        harness.Service.MarkUpdated([1, 2, 3]);
+        await harness.Service.RefreshIncrementalAsync();
+        await harness.Service.RefreshIncrementalAsync();
+        await harness.Service.MarkUpdatedAsync([1, 2, 3]);
         var normal = harness.Handler.Send;
         var paths = new List<string>();
         harness.Handler.Send = (request, token) =>
@@ -313,9 +315,9 @@ public sealed class IncrementalRefreshTests
             return normal(request, token);
         };
         await harness.Service.RefreshIncrementalAsync();
-        harness.Service.MarkUpdated([1]);
+        await harness.Service.MarkUpdatedAsync([1]);
         await harness.Service.RefreshIncrementalAsync();
-        harness.Service.MarkUpdated([1]);
+        await harness.Service.MarkUpdatedAsync([1]);
         await harness.Service.RefreshIncrementalAsync();
         Assert.Equal(["/v0/item/1.json", "/v0/item/2.json", "/v0/item/3.json"], paths);
     }

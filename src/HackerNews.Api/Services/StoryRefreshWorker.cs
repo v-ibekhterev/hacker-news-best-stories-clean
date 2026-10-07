@@ -16,7 +16,7 @@ public sealed class StoryRefreshWorker(
             await storiesService.RefreshIncrementalAsync();
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                await storiesService.RefreshAsync();
+                await storiesService.RefreshIncrementalAsync();
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

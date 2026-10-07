@@ -13,7 +13,14 @@ public sealed class HackerNewsUpdatesClient(
 {
     private const int MaximumEventCharacters = 1_048_576;
 
-    public async Task ListenAsync(Action<IReadOnlyCollection<long>> onUpdated, CancellationToken cancellationToken)
+    public Task ListenAsync(Action<IReadOnlyCollection<long>> onUpdated, CancellationToken cancellationToken) =>
+        ListenAsync(ids =>
+        {
+            onUpdated(ids);
+            return Task.CompletedTask;
+        }, cancellationToken);
+
+    public async Task ListenAsync(Func<IReadOnlyCollection<long>, Task> onUpdated, CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, "updates.json");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
@@ -49,7 +56,7 @@ public sealed class HackerNewsUpdatesClient(
                 }
                 if (eventName is "put" or "patch")
                 {
-                    onUpdated(ExtractItemIds(eventName, data.ToString()));
+                    await onUpdated(ExtractItemIds(eventName, data.ToString()));
                 }
                 eventName = "";
                 data.Clear();

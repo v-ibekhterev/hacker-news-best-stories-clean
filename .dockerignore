@@ -3,3 +3,6 @@
 .git
 .vs
 TestResults
+.env
+.env.*
+.github

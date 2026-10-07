@@ -6,6 +6,8 @@ using HackerNews.Api.Services;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
+using HackerNews.Api.Storage;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddOptions<HackerNewsOptions>()
@@ -20,6 +22,16 @@ builder.Services.AddHttpClient<HackerNewsClient>((services, client) =>
     client.Timeout = settings.RequestTimeout;
 });
 builder.Services.AddSingleton<BestStoriesService>();
+builder.Services.AddSingleton(services =>
+{
+    var connectionString = services.GetRequiredService<IConfiguration>().GetConnectionString("Postgres");
+    if (string.IsNullOrWhiteSpace(connectionString))
+    {
+        throw new InvalidOperationException("Configure ConnectionStrings:Postgres; no in-memory storage fallback is allowed.");
+    }
+    return NpgsqlDataSource.Create(connectionString);
+});
+builder.Services.AddSingleton<IStoryStateStore, PostgresStoryStateStore>();
 builder.Services.AddHttpClient<HackerNewsUpdatesClient>((services, client) =>
 {
     client.BaseAddress = new Uri(services.GetRequiredService<IOptions<HackerNewsOptions>>().Value.BaseUrl);
@@ -53,7 +65,9 @@ builder.Services.AddOpenApi(options => options.AddOperationTransformer((operatio
     }
     return Task.CompletedTask;
 }));
-builder.Services.AddHealthChecks().AddCheck<SnapshotReadinessCheck>("snapshot", tags: ["ready"]);
+builder.Services.AddHealthChecks()
+    .AddCheck<SnapshotReadinessCheck>("snapshot", tags: ["ready"])
+    .AddCheck<DatabaseReadinessCheck>("database", tags: ["ready"], timeout: TimeSpan.FromSeconds(5));
 
 var app = builder.Build();
 app.UseExceptionHandler();
@@ -61,6 +75,7 @@ app.MapStories();
 app.MapOpenApi();
 app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
 app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = check => check.Tags.Contains("ready") });
+await app.Services.GetRequiredService<BestStoriesService>().InitializeAsync();
 app.Run();
 
 public partial class Program;

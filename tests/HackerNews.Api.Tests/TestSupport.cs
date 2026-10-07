@@ -9,6 +9,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Time.Testing;
+using HackerNews.Api.Storage;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace HackerNews.Api.Tests;
 
@@ -48,7 +50,7 @@ internal sealed class ServiceHarness : IDisposable
     public StubHandler UpdatesHandler { get; } = new();
     public IHttpClientFactory ClientFactory => provider.GetRequiredService<IHttpClientFactory>();
 
-    public ServiceHarness(Action<HackerNewsOptions>? configure = null)
+    public ServiceHarness(Action<HackerNewsOptions>? configure = null, IStoryStateStore? store = null)
     {
         var services = new ServiceCollection();
         services.AddLogging();
@@ -58,6 +60,7 @@ internal sealed class ServiceHarness : IDisposable
         services.AddHttpClient<HackerNewsClient>(client => client.BaseAddress = new Uri("https://fake.test/v0/"))
             .ConfigurePrimaryHttpMessageHandler(() => Handler);
         services.AddSingleton<BestStoriesService>();
+        services.AddSingleton<IStoryStateStore>(store ?? new MemoryStoryStateStore());
         services.AddSingleton<StoryRefreshWorker>();
         services.AddHttpClient<HackerNewsUpdatesClient>(client =>
         {
@@ -90,6 +93,13 @@ internal sealed class ApiFactory : WebApplicationFactory<Program>
         builder.ConfigureServices(services =>
         {
             services.RemoveAll<IHostedService>();
+            services.RemoveAll<IStoryStateStore>();
+            services.AddSingleton<IStoryStateStore, MemoryStoryStateStore>();
+            services.Configure<HealthCheckServiceOptions>(options =>
+            {
+                var database = options.Registrations.Single(check => check.Name == "database");
+                options.Registrations.Remove(database);
+            });
             if (ConfigureOptions is not null)
             {
                 services.PostConfigure(ConfigureOptions);
