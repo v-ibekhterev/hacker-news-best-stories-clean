@@ -13,7 +13,7 @@ public sealed class StoryRefreshWorker(
         using var timer = new PeriodicTimer(options.Value.RefreshInterval, timeProvider);
         try
         {
-            await storiesService.RefreshAsync();
+            await storiesService.RefreshIncrementalAsync();
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
                 await storiesService.RefreshAsync();

@@ -20,6 +20,12 @@ builder.Services.AddHttpClient<HackerNewsClient>((services, client) =>
     client.Timeout = settings.RequestTimeout;
 });
 builder.Services.AddSingleton<BestStoriesService>();
+builder.Services.AddHttpClient<HackerNewsUpdatesClient>((services, client) =>
+{
+    client.BaseAddress = new Uri(services.GetRequiredService<IOptions<HackerNewsOptions>>().Value.BaseUrl);
+    client.Timeout = Timeout.InfiniteTimeSpan;
+});
+builder.Services.AddHostedService<StoryUpdatesWorker>();
 builder.Services.AddHostedService<StoryRefreshWorker>();
 builder.Services.AddProblemDetails();
 builder.Services.AddOpenApi(options => options.AddOperationTransformer((operation, context, _) =>

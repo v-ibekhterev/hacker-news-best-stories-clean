@@ -65,28 +65,74 @@ JSON fields are ignored. Duplicate upstream IDs are retrieved once.
 ```text
 Requests -> endpoint (validation/HTTP mapping) -> BestStoriesService -> immutable snapshot
                                                   ^
-BackgroundService -> shared refresh task -> typed HackerNewsClient -> Hacker News
-                        bounded item concurrency -> map/filter/sort -> atomic swap
+Initial load / minute timer -> shared refresh task -> typed HackerNewsClient
+                                     ^                  |
+Updates SSE worker -> deduplicated pending IDs       Hacker News
+                                     |
+                    bounded batches -> merge/filter/sort -> atomic swap
 ```
 
 The hosted worker starts loading immediately. Initial callers share one load task and
 wait at most 15 seconds each; caller cancellation or wait timeout does not cancel work
 shared by other callers. After a failed first attempt, reads remain unavailable until
 the worker successfully refreshes; repeated API calls do not retry the upstream.
-Host shutdown cancels upstream work.
+Host shutdown cancels upstream work and the stream.
 
-Every refresh retrieves all IDs, then items with bounded `Parallel.ForEachAsync`.
-An item HTTP error, timeout, malformed JSON, or unusable item does not discard other
-successful items; failures are logged with the item ID. Publish only after the ID call
-succeeds and at least one valid story is available. A complete immutable array is
-published in one atomic reference replacement. Reads during refresh use the previous
-complete snapshot without upstream calls or waiting.
+The initial load retrieves all distinct positive best-story IDs and their items with
+bounded `Parallel.ForEachAsync`. Later refreshes retrieve the membership list but fetch
+only newly added candidates, notified changes, deferred failures, and reconciliation
+work. Departed candidates are removed. Each normal batch fetches at most
+`UpdateBatchSize` items, with at most `MaxUpstreamConcurrency` simultaneous item calls.
+The initial load remains a full acquisition, not a limited top-100 fetch.
+
+One long-lived connection subscribes to `updates.json` with `Accept: text/event-stream`.
+Firebase `put` and `patch` payloads supply item IDs; item values, not array indexes,
+are extracted. Profiles are ignored, and IDs outside the current candidate set are
+discarded before making any item request. Events are notifications, not item records:
+we still GET each relevant item to obtain its current score. The listener records
+notifications immediately; the minute timer processes the deduplicated queue.
+Removing an ID from the updates feed is not interpreted as deletion of that story.
+
+The pending FIFO queue is bounded by the tracked candidate universe, not by event
+volume. Duplicate notifications coalesce; overflow waits for later batches. An update
+arriving while its item is being fetched queues another read, so finishing the old
+read cannot erase a newer notification. One shared refresh task owns cache changes.
+The API and health probes never read that mutable cache, only its immutable snapshot.
+
+For a successful item GET, null/deleted/dead/non-story/unusable data removes the old
+cached record. HTTP errors, timeouts, and malformed responses retain the previous
+record and requeue that ID for a later batch, with no immediate retry. Failures are
+logged with item IDs. Other successful changes are merged with unchanged records.
+Publish only after the membership call succeeds and a nonempty valid cache exists.
+A complete immutable array is published in one atomic reference replacement. Reads
+during refresh use the previous complete snapshot without upstream calls or waiting.
+Ticks with no item work or membership changes retain the existing snapshot and timestamp.
+
+Every `ReconciliationInterval`, all current candidates are queued for a **rolling**
+recheck. The same batch ceiling and FIFO queue apply; this is not a second full-refresh
+fan-out. A complete pass still requires one item GET per candidate, spread over ticks.
+It catches missed notifications without fetching the whole list every minute.
 
 Refresh triggers coalesce onto a shared task under a short lock. The worker awaits
 each refresh before handling another timer tick; missed ticks coalesce, never overlap.
-There are **no automatic HTTP retries**: the next periodic refresh retries acquisition.
+There are **no immediate item HTTP retries**: failed IDs wait for a later batch.
 Failed/empty refreshes retain the last successful snapshot indefinitely, deliberately
 favoring availability over a strict freshness SLA.
+
+The stream uses a separate client with no overall lifetime timeout. Connection headers
+are bounded by `RequestTimeout`; reads are canceled after `StreamIdleTimeout` with no
+data/keep-alive lines. EOF, transport errors, malformed events, Firebase cancellation,
+and idle timeout trigger reconnects. Reconnect delay doubles from `StreamReconnectDelay`
+to a 60-second cap (or the configured base delay if larger), resetting after a valid
+data event. Reconnects do not trigger a full acquisition. Firebase redirects are handled
+by the HTTP handler. Events over 1 MiB of assembled data are rejected and logged.
+
+HN does not document replay cursors, retention, or complete change-delivery guarantees.
+Streaming reduces polling gaps but is **not** a durable change log. Notifications before
+initial membership is known may be ignored; notifications during item acquisition are
+preserved. Disconnect gaps and bootstrap gaps are recovered by rolling reconciliation.
+There is no guarantee of an instantaneous globally consistent ranking from separate
+item GETs. Ordering uses the latest successfully acquired score of each cached item.
 
 `/health/live` reports process liveness; `/health/ready` returns 503 until a snapshot
 exists and remains healthy while stale data is usable. Neither probe calls upstream.
@@ -101,11 +147,15 @@ Strongly typed `HackerNews` options are validated at startup. Override using
 | Setting | Default | Constraint |
 |---------|---------|------------|
 | `BaseUrl` | `https://hacker-news.firebaseio.com/v0/` | Absolute HTTP(S) URL ending in `/` |
-| `RefreshInterval` | `00:01:00` | Positive, within timer range |
+| `RefreshInterval` | `00:01:00` | Positive, within timer range; membership check and batch cadence |
 | `RequestTimeout` | `00:00:10` | Positive, within HttpClient timeout range |
 | `InitialLoadWaitTimeout` | `00:00:15` | Positive, within timer range |
 | `MaxUpstreamConcurrency` | `10` | At least 1 |
 | `MaximumStoryCount` | `100` | At least 1 |
+| `UpdateBatchSize` | `100` | At least 1; item reads per incremental tick |
+| `ReconciliationInterval` | `00:30:00` | Positive, within timer range; enqueue rolling rechecks |
+| `StreamReconnectDelay` | `00:00:05` | Positive, within timer range; base reconnect backoff |
+| `StreamIdleTimeout` | `00:01:00` | Positive, within timer range; stream read inactivity |
 
 `RequestTimeout` bounds each upstream request, not the complete refresh. A large list
 can take several request-timeout batches to load; initial waits are independently bounded.
@@ -114,7 +164,12 @@ can take several request-timeout batches to load; initial waits are independentl
 
 Unit tests cover mapping/filtering, sorting, partial failures, atomic publication,
 stale fallback, single-flight initialization/refresh, cancellation, wait timeout,
-and bounded item concurrency. In-process `WebApplicationFactory` tests cover HTTP
+bounded item concurrency, incremental batch limits, deduplication, irrelevant updates,
+membership changes, confirmed deletion, retry backlog, and notifications during
+bootstrap/item reads. SSE tests cover initial `put`, nested `patch`, multiline data,
+profiles, keep-alives, errors, cancellation, idle timeout, and reconnect backoff.
+Rolling reconciliation tests prove all candidates are eventually visited across batches.
+In-process `WebApplicationFactory` tests cover HTTP
 validation, exact response fields, 503, health, OpenAPI, and 120 concurrent requests.
 All upstream calls use stubbed handlers. Timer tests use `FakeTimeProvider`; concurrency
 tests use gates/channels, not arbitrary sleeps. Safety deadlines only detect hung tests.
@@ -136,6 +191,16 @@ single owner/lease preventing cross-node stampedes. This is not implemented.
 
 The service is not a full Hacker News ranking engine: it sorts only the upstream best
 list, and partial refreshes may contain fewer stories. It has no maximum stale age.
+`LoadedAt` is the snapshot publication time, not a guarantee that every included item
+was retrieved at that time. Traffic is approximately one membership GET per tick plus
+up to `UpdateBatchSize` item GETs, excluding the one-time full initial load and stream
+reconnects. If changes arrive faster than batches drain, freshness falls behind.
+Concurrency and batch limits are not a strict requests-per-second limit. Rolling
+reconciliation has no hard completion deadline; for a million candidates at 100 per
+minute it would take at least 10,000 ticks, even without other pending work. Full
+in-memory caching and sorting still limit scale; this is not a million-record storage
+or export implementation. Increasing a caller's count never expands the source dataset
+or triggers acquisition.
 Future work, guided by real requirements: snapshot-age/refresh-duration metrics,
 OpenTelemetry, controlled load testing, CI/dependency scanning, freshness budgets,
 and measured retry/circuit-breaker policies.

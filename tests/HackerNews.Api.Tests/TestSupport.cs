@@ -44,6 +44,9 @@ internal sealed class ServiceHarness : IDisposable
     public TestLifetime Lifetime { get; } = new();
     public BestStoriesService Service { get; }
     public StoryRefreshWorker Worker { get; }
+    public StoryUpdatesWorker UpdatesWorker { get; }
+    public StubHandler UpdatesHandler { get; } = new();
+    public IHttpClientFactory ClientFactory => provider.GetRequiredService<IHttpClientFactory>();
 
     public ServiceHarness(Action<HackerNewsOptions>? configure = null)
     {
@@ -56,9 +59,16 @@ internal sealed class ServiceHarness : IDisposable
             .ConfigurePrimaryHttpMessageHandler(() => Handler);
         services.AddSingleton<BestStoriesService>();
         services.AddSingleton<StoryRefreshWorker>();
+        services.AddHttpClient<HackerNewsUpdatesClient>(client =>
+        {
+            client.BaseAddress = new Uri("https://fake.test/v0/");
+            client.Timeout = Timeout.InfiniteTimeSpan;
+        }).ConfigurePrimaryHttpMessageHandler(() => UpdatesHandler);
+        services.AddSingleton<StoryUpdatesWorker>();
         provider = services.BuildServiceProvider();
         Service = provider.GetRequiredService<BestStoriesService>();
         Worker = provider.GetRequiredService<StoryRefreshWorker>();
+        UpdatesWorker = provider.GetRequiredService<StoryUpdatesWorker>();
     }
 
     public void Dispose()

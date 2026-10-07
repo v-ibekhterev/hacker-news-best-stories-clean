@@ -26,6 +26,10 @@ public sealed class ConfigurationTests
     [InlineData("count")]
     [InlineData("url")]
     [InlineData("slash")]
+    [InlineData("batch")]
+    [InlineData("reconciliation")]
+    [InlineData("reconnect")]
+    [InlineData("idle")]
     public void IsValid_InvalidOptions_Rejects(string setting)
     {
         var options = new HackerNewsOptions();
@@ -38,6 +42,10 @@ public sealed class ConfigurationTests
             case "count": options.MaximumStoryCount = 0; break;
             case "url": options.BaseUrl = "file:///tmp/"; break;
             case "slash": options.BaseUrl = "https://fake.test/v0"; break;
+            case "batch": options.UpdateBatchSize = 0; break;
+            case "reconciliation": options.ReconciliationInterval = TimeSpan.Zero; break;
+            case "reconnect": options.StreamReconnectDelay = TimeSpan.Zero; break;
+            case "idle": options.StreamIdleTimeout = TimeSpan.Zero; break;
         }
         Assert.False(options.IsValid());
     }

@@ -23,10 +23,33 @@ public sealed class BestStoriesService(
     private Task? activeRefresh;
     private Task? initialLoad;
     private StorySnapshot? snapshot;
+    private Dictionary<long, StoryResponse> cache = new();
+    private HashSet<long> candidates = new();
+    private readonly Queue<long> pending = new();
+    private readonly HashSet<long> pendingIds = new();
+    private DateTimeOffset? reconciliationStartedAt;
 
     public StorySnapshot? Snapshot => Volatile.Read(ref snapshot);
 
-    public Task RefreshAsync()
+    public void MarkUpdated(IEnumerable<long> ids)
+    {
+        lock (gate)
+        {
+            foreach (var id in ids)
+            {
+                if (candidates.Contains(id))
+                {
+                    Enqueue(id);
+                }
+            }
+        }
+    }
+
+    public Task RefreshAsync() => StartRefresh(fullRefresh: true);
+
+    public Task RefreshIncrementalAsync() => StartRefresh(fullRefresh: false);
+
+    private Task StartRefresh(bool fullRefresh)
     {
         lock (gate)
         {
@@ -35,7 +58,7 @@ public sealed class BestStoriesService(
                 return activeRefresh;
             }
 
-            activeRefresh = RefreshCoreAsync(lifetime.ApplicationStopping);
+            activeRefresh = RefreshCoreAsync(fullRefresh, lifetime.ApplicationStopping);
             initialLoad ??= activeRefresh;
             return activeRefresh;
         }
@@ -72,7 +95,15 @@ public sealed class BestStoriesService(
         return current is null ? null : current.Stories.Take(count).ToImmutableArray();
     }
 
-    private async Task RefreshCoreAsync(CancellationToken cancellationToken)
+    private void Enqueue(long id)
+    {
+        if (pendingIds.Add(id))
+        {
+            pending.Enqueue(id);
+        }
+    }
+
+    private async Task RefreshCoreAsync(bool fullRefresh, CancellationToken cancellationToken)
     {
         // Yield before network work so the shared task is published under the gate first.
         await Task.Yield();
@@ -81,8 +112,57 @@ public sealed class BestStoriesService(
             using var httpClient = clientFactory.CreateClient(nameof(HackerNewsClient));
             var client = new HackerNewsClient(httpClient, loggerFactory.CreateLogger<HackerNewsClient>());
             var ids = await client.GetBestStoryIdsAsync(cancellationToken);
-            var stories = new ConcurrentBag<(long Id, StoryResponse Story)>();
-            await Parallel.ForEachAsync(ids.Distinct(), new ParallelOptions
+            var membership = ids.Where(id => id > 0).ToHashSet();
+            long[] selected;
+            lock (gate)
+            {
+                var additions = membership.Except(candidates).ToArray();
+                candidates = membership;
+                // Purge departed IDs so a burst of unrelated updates cannot grow the backlog.
+                var retained = pending.Where(membership.Contains).ToArray();
+                pending.Clear();
+                pendingIds.Clear();
+                foreach (var id in retained.Concat(additions))
+                {
+                    Enqueue(id);
+                }
+
+                if (fullRefresh || reconciliationStartedAt is null)
+                {
+                    selected = membership.ToArray();
+                    foreach (var id in selected)
+                    {
+                        pendingIds.Remove(id);
+                    }
+                    pending.Clear();
+                    reconciliationStartedAt = timeProvider.GetUtcNow();
+                }
+                else
+                {
+                    if (timeProvider.GetUtcNow() - reconciliationStartedAt >= settings.ReconciliationInterval)
+                    {
+                        foreach (var id in membership)
+                        {
+                            Enqueue(id);
+                        }
+                        reconciliationStartedAt = timeProvider.GetUtcNow();
+                        logger.LogInformation("Queued rolling reconciliation for {CandidateCount} candidates", membership.Count);
+                    }
+
+                    var batch = new List<long>();
+                    while (batch.Count < settings.UpdateBatchSize && pending.TryDequeue(out var id))
+                    {
+                        pendingIds.Remove(id);
+                        batch.Add(id);
+                    }
+                    selected = batch.ToArray();
+                }
+            }
+
+            var changes = new ConcurrentDictionary<long, StoryResponse>();
+            var removed = new ConcurrentBag<long>();
+            var failed = new ConcurrentBag<long>();
+            await Parallel.ForEachAsync(selected, new ParallelOptions
             {
                 MaxDegreeOfParallelism = settings.MaxUpstreamConcurrency,
                 CancellationToken = cancellationToken
@@ -95,30 +175,66 @@ public sealed class BestStoriesService(
                         string.IsNullOrWhiteSpace(item.Title) || string.IsNullOrWhiteSpace(item.By) ||
                         item.Time is null || item.Score is null)
                     {
+                        removed.Add(id);
                         return;
                     }
 
                     var story = new StoryResponse(item.Title, string.IsNullOrWhiteSpace(item.Url) ? null : item.Url,
                         item.By, DateTimeOffset.FromUnixTimeSeconds(item.Time.Value),
                         item.Score.Value, item.Descendants ?? 0);
-                    stories.Add((id, story));
+                    changes[id] = story;
                 }
                 catch (Exception exception) when (exception is HttpRequestException or JsonException or ArgumentOutOfRangeException ||
                                                   exception is OperationCanceledException && !token.IsCancellationRequested)
                 {
                     logger.LogWarning(exception, "Skipping failed Hacker News item {ItemId}", id);
+                    if (exception is ArgumentOutOfRangeException)
+                    {
+                        removed.Add(id);
+                    }
+                    else
+                    {
+                        failed.Add(id);
+                    }
                 }
             });
 
             cancellationToken.ThrowIfCancellationRequested();
-            if (stories.IsEmpty)
+            var nextCache = cache.Where(entry => membership.Contains(entry.Key))
+                .ToDictionary(entry => entry.Key, entry => entry.Value);
+            foreach (var id in removed)
+            {
+                nextCache.Remove(id);
+            }
+            foreach (var entry in changes)
+            {
+                nextCache[entry.Key] = entry.Value;
+            }
+            cache = nextCache;
+            lock (gate)
+            {
+                foreach (var id in failed)
+                {
+                    Enqueue(id);
+                }
+                logger.LogInformation("Processed {ItemCount} candidate items; {PendingCount} remain pending",
+                    selected.Length, pendingIds.Count);
+            }
+
+            if (cache.Count == 0)
             {
                 logger.LogWarning("Refresh produced no valid stories; retaining the previous snapshot");
                 return;
             }
 
-            var next = new StorySnapshot(stories.OrderByDescending(entry => entry.Story.Score)
-                .ThenBy(entry => entry.Id).Select(entry => entry.Story).ToImmutableArray(),
+            if (changes.IsEmpty && removed.IsEmpty && Snapshot is not null &&
+                Snapshot.Stories.Length == cache.Count)
+            {
+                return;
+            }
+
+            var next = new StorySnapshot(cache.OrderByDescending(entry => entry.Value.Score)
+                .ThenBy(entry => entry.Key).Select(entry => entry.Value).ToImmutableArray(),
                 timeProvider.GetUtcNow());
             Volatile.Write(ref snapshot, next);
             logger.LogInformation("Published {StoryCount} stories at {LoadedAt}", next.Stories.Length, next.LoadedAt);
